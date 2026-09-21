@@ -110,6 +110,39 @@ Each run writes a SQLite catalog (`<working>/catalog.sqlite`) recording every
 item's size, mtime, mode and plaintext/ciphertext SHA-256 — used for integrity
 verification, and the basis for resumable runs.
 
+### Installing Globus Connect Personal (Linux)
+
+A forthcoming Globus transport can move the staged ciphertext between Globus
+collections. If the remote already exposes a Globus collection you need install
+nothing locally; otherwise you can stand up a transient personal endpoint.
+Globus Connect Personal is closed-source vendor software (~100 MB), so it is not
+bundled here — install a per-user copy with:
+
+```bash
+crypt4gh-install-gcp            # or: python -m crypt4gh.pack.gcp_install
+```
+
+This is a no-op if `globusconnectpersonal` is already on your `PATH`. Otherwise
+it downloads the current stable Linux build, unpacks it under
+`~/.local/share/gcp/`, and links the launcher at
+`~/.local/bin/globusconnectpersonal`. Useful flags:
+
+* `--force` — reinstall even if one is already on `PATH`.
+* `--sha256 <hex>` — verify the download against a pinned checksum (the tool
+  prints the SHA-256 it fetched so you can pin it next time).
+* `--setup-key <KEY>` — register the endpoint straight away using a setup key
+  from <https://app.globus.org/collections?add>.
+* `--start` — start the endpoint after installing (and registering).
+
+Registration still needs that one-time setup key (Globus has no fully headless
+sign-up). After installing:
+
+```bash
+# 1. Create a collection + setup key at https://app.globus.org/collections?add
+globusconnectpersonal -setup --setup-key <KEY>
+globusconnectpersonal -start &
+```
+
 ## File Format
 
 Refer to the [specifications](http://samtools.github.io/hts-specs/crypt4gh.pdf) or this [documentation](https://crypt4gh.readthedocs.io/en/latest/encryption.html).

@@ -26,6 +26,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - permissions, mtimes, empty directories and symlinks are preserved.
 - Pluggable crypto and transport layers, so an encrypt-at-source mode and a
   Globus transport backend can be added without changing the pipeline.
+- **`crypt4gh-install-gcp`** (`crypt4gh.pack.gcp_install`): a Linux-only,
+  stdlib-only per-user installer for Globus Connect Personal, groundwork for the
+  forthcoming Globus transport. Downloads the closed-source vendor tarball (not
+  vendored into the repo) to `~/.local/share/gcp/` and links the launcher at
+  `~/.local/bin/globusconnectpersonal`; a no-op when one is already on `PATH`.
+  Verifies the download against an optional pinned `--sha256`, rejects unsafe
+  archives, and can register (`--setup-key`) and start (`--start`) the endpoint.
 - A `pytest` unit-test suite under `tests/unit/` (crypto/header, key formats,
   KDFs, naming, codecs, catalog, transport parsing, and pack/unpack round-trips).
 

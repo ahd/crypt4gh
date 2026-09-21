@@ -51,6 +51,7 @@ globus = ["globus-sdk>=3"]
 crypt4gh = "crypt4gh.__main__:main"
 crypt4gh-keygen = "crypt4gh.keys.__main__:main"
 crypt4gh-completions = "crypt4gh.completions.__main__:main"
+crypt4gh-install-gcp = "crypt4gh.pack.gcp_install:main"
 
 [dependency-groups]
 dev = ["pytest>=8"]
