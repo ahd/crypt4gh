@@ -102,7 +102,7 @@ Options:
   The default is `none` (genomic payloads are usually already compressed).
 * Source or destination may be a remote, rsync-style `[user@]host:/path`.
   Ciphertext is staged in a local working directory (`--working`, default
-  `./crypt4gh-work` or `$C4GH_WORKDIR`) and moved with rsync over ssh; a remote
+  `$C4GH_WORKDIR` or else `./crypt4gh-work`) and moved with rsync over ssh; a remote
   *source* is streamed over ssh so plaintext is never written to disk in transit.
 * `--jobs N` sets the number of parallel workers.
 

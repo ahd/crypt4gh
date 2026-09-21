@@ -53,18 +53,95 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rather than failing the item; error paths now close pipes and remove partial
   outputs.
 
-## [1.8.6]
-- Zsh completions; completions help/message updates.
+## [1.8.6] – 2026-05-02
 
-## [1.7] – [1.8.6]
-- Multiple recipients, edit lists and rearrange, separate header/data handling,
-  bundled libsodium build with `SODIUM_INSTALL=system` option. (See git history
-  for details.)
+Released as a `1.8.x` series: PyPI would not let `1.8` / `1.8.0` be reused after
+deletion, so the first published artifact was `1.8.1`, then `1.8.3`, with `1.8.6`
+the final tagged release.
 
-## [1.0] – [1.6]
-- Initial public releases of the Crypt4GH reference utility: streaming
+### Added
+- **Zsh completions** alongside bash, with a separate installer script for shell
+  completions and a `--show` option; completions help/message updates.
+
+### Changed
+- **Dropped the PyNaCl dependency** in favour of a specialised C extension binding
+  directly to libsodium — PyNaCl allocated fresh `bytes` buffers, so cipherdata is
+  now handled in a reused `bytearray` (notably better for large files) and the
+  `cipher_chunker` is gone. The build finds libsodium either system-wide
+  (`SODIUM_INSTALL=system`, using `CFLAGS`/`LDFLAGS`) or from a bundled copy.
+- Packaging for PyPI: wheel builds (Python 3.9+), MANIFEST-based package data,
+  trusted-publisher env vars, and PyPI badges/classifiers.
+- Keygen internals updated; debug leftovers removed.
+
+### Fixed
+- Keygen `--force` / directory logic and file permissions (no longer relies on
+  the umask).
+
+## [1.7] – 2024-05-24
+
+### Added
+- **Separate header stream:** store the Crypt4GH header separately from the data,
+  plus a CLI option to **re-encrypt only the header** (with an early bail-out
+  path).
+- Edit lists now allow `skip 0`.
+
+### Changed
+- Python 3.12 in CI; dropped Python 3.6.
+- Error (instead of silent failure) when a public key does not exist.
+
+### Fixed
+- Removed stray use of temporary files in the tool and in the tests.
+
+## [1.6] – 2022-08-10
+### Fixed
+- Keygen generates the private key before the public key.
+
+## [1.5] – 2021-03-07
+### Fixed
+- Issue #27; refactored PEM loading to strip trailing newlines and blank lines.
+
+## [1.4] – 2020-07-27
+### Fixed
+- Handling of an unencrypted ssh key.
+### Changed
+- More descriptive message for scrypt support; packaging updates.
+
+## [1.2] – 2020-03-13
+
+Released but never git-tagged. (There was no 1.3 release; the project went
+1.2 → 1.4.)
+
+### Added
+- **Multiple recipients** (`--recipient` repeatable), with de-duplication.
+- Generate a key on the fly if none is specified.
+- `DEBUG` switch via an environment variable.
+
+### Changed
+- umask handling; bash-completion updates. Dropped the bundled LaTeX spec in
+  favour of hts-specs.
+
+## [1.1] – 2019-12-04
+
+### Changed
+- **Performance:** ChaCha20 encryption/decryption now uses the PyNaCl bindings
+  instead of OpenSSL.
+- Refactored `cli.py`; edit-list cleanup and an added assertion.
+
+### Fixed
+- Prompt for an empty passphrase.
+
+## [1.0] – 2019-12-01
+
+- Initial public release of the Crypt4GH reference utility: streaming
   `encrypt` / `decrypt` / `reencrypt`, X25519 + ChaCha20-Poly1305, Crypt4GH and
-  OpenSSH key formats, `crypt4gh-keygen`.
+  OpenSSH key formats, `crypt4gh-keygen`, and the edit-list oracle.
 
 [Unreleased]: https://github.com/EGA-archive/crypt4gh/compare/v1.8.6...HEAD
 [1.8.6]: https://github.com/EGA-archive/crypt4gh/releases/tag/v1.8.6
+[1.7]: https://github.com/EGA-archive/crypt4gh/releases/tag/v1.7
+[1.6]: https://github.com/EGA-archive/crypt4gh/releases/tag/v1.6
+[1.5]: https://github.com/EGA-archive/crypt4gh/releases/tag/v1.5
+[1.4]: https://github.com/EGA-archive/crypt4gh/releases/tag/v1.4
+[1.2]: https://github.com/EGA-archive/crypt4gh/commits/v1.4
+[1.1]: https://github.com/EGA-archive/crypt4gh/releases/tag/v1.1
+[1.0]: https://github.com/EGA-archive/crypt4gh/releases/tag/v1.0
