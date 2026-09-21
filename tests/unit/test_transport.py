@@ -37,11 +37,15 @@ def test_push_to_ssh_builds_rsync(monkeypatch, tmp_path):
     monkeypatch.setattr(transport.subprocess, 'check_call', lambda argv: calls.append(argv))
     dest = transport.parse_endpoint('bob@example.org:/incoming')
     transport.push(str(tmp_path), dest)
-    assert len(calls) == 1
-    argv = calls[0]
-    assert argv[0] == 'rsync'
-    assert argv[-1] == 'bob@example.org:/incoming/'
-    assert argv[-2] == os.path.join(str(tmp_path), '')
+    # It creates the remote dir (ssh mkdir), then rsyncs.
+    assert len(calls) == 2
+    mkdir_call, rsync_call = calls
+    assert mkdir_call[0] == 'ssh' and mkdir_call[1] == 'bob@example.org'
+    assert 'mkdir -p' in mkdir_call[2]
+    assert rsync_call[0] == 'rsync'
+    assert '--mkpath' not in rsync_call          # not portable; must stay gone
+    assert rsync_call[-1] == 'bob@example.org:/incoming/'
+    assert rsync_call[-2] == os.path.join(str(tmp_path), '')
 
 
 def test_pull_from_ssh_builds_rsync(monkeypatch, tmp_path):

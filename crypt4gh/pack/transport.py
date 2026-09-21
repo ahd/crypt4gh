@@ -11,6 +11,7 @@ it transfers files at rest between endpoints.
 import os
 import re
 import shutil
+import shlex
 import logging
 import subprocess
 from dataclasses import dataclass
@@ -57,9 +58,15 @@ def _hostspec(ep):
 
 
 def _rsync(src, dst):
-    argv = ['rsync', '-a', '--partial', '--mkpath', src, dst]
+    # NB: no --mkpath (needs rsync 3.2.3+; macOS ships 2.6.9). The destination
+    # directory is created explicitly before rsync runs.
+    argv = ['rsync', '-a', '--partial', src, dst]
     LOG.info('rsync %s -> %s', src, dst)
     subprocess.check_call(argv)
+
+
+def _ssh_mkdir(dest):
+    subprocess.check_call(['ssh', _hostspec(dest), f'mkdir -p {shlex.quote(dest.path)}'])
 
 
 def push(working_dir, dest):
@@ -69,6 +76,7 @@ def push(working_dir, dest):
         os.makedirs(dest.path, exist_ok=True)
         _rsync(src, os.path.join(dest.path, ''))
     elif dest.kind == 'ssh':
+        _ssh_mkdir(dest)
         _rsync(src, f'{_hostspec(dest)}:{dest.path}/')
     else:
         raise ValueError(f'Unsupported destination kind: {dest.kind}')
