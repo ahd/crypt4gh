@@ -119,3 +119,14 @@ venv.bak/
 
 # mypy
 .mypy_cache/
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
+.beads/proxieddb/
+*.gate.lock*
+
+# Beads: share the issue export, ignore the local Dolt store + runtime files
+.beads/*
+!.beads/issues.jsonl
