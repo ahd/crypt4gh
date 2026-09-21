@@ -7,6 +7,13 @@ import sys
 from . import cli
 
 def main(argv=sys.argv[1:]):
+
+    # Directory-aware verbs have their own (argparse) CLI; route before docopt
+    # so the streaming verbs' usage string stays untouched.
+    if argv and argv[0] in ('pack', 'unpack'):
+        from .pack import cli as pack_cli
+        return pack_cli.main(argv)
+
     try:
 
         # Parse CLI arguments

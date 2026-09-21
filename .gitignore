@@ -11,6 +11,10 @@ libsodium-build
 crypt4gh/sodium.*
 !crypt4gh/sodium.c
 
+# pack/unpack staging + catalog
+crypt4gh-work/
+catalog.sqlite*
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

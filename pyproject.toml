@@ -1,0 +1,71 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "crypt4gh"
+dynamic = ["version"]
+description = "GA4GH cryptographic utilities"
+readme = "README.md"
+requires-python = ">=3.13"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Frédéric Haziza", email = "silverdaz@gmail.com" }]
+keywords = ["crypt4gh", "ga4gh", "cryptography", "genomics", "encryption"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Natural Language :: English",
+    "Operating System :: MacOS :: MacOS X",
+    "Operating System :: POSIX",
+    "Operating System :: POSIX :: BSD",
+    "Operating System :: POSIX :: Linux",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Healthcare Industry",
+    "Intended Audience :: Information Technology",
+    "Intended Audience :: Science/Research",
+    "Topic :: Security :: Cryptography",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "Topic :: Scientific/Engineering :: Medical Science Apps.",
+    "Environment :: Console",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+]
+dependencies = [
+    "docopt-ng",
+    "cryptography>=2.8",
+    "bcrypt",
+]
+
+[project.urls]
+Homepage = "https://www.github.com/EGA-archive/crypt4gh"
+Documentation = "https://crypt4gh.readthedocs.io"
+Repository = "https://github.com/EGA-archive/crypt4gh"
+
+[project.optional-dependencies]
+# The future `pack`/`unpack` Globus transport backend (not required for ssh/rsync).
+globus = ["globus-sdk>=3"]
+
+[project.scripts]
+crypt4gh = "crypt4gh.__main__:main"
+crypt4gh-keygen = "crypt4gh.keys.__main__:main"
+crypt4gh-completions = "crypt4gh.completions.__main__:main"
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.setuptools]
+zip-safe = false
+
+[tool.setuptools.dynamic]
+version = { attr = "crypt4gh.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["crypt4gh*"]
+
+[tool.setuptools.package-data]
+"crypt4gh.completions" = ["*.bash", "*.zsh"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests/unit"]

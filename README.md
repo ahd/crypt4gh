@@ -79,6 +79,37 @@ $ crypt4gh decrypt --sk alice.sec < file.c4gh
 
 [![asciicast](https://asciinema.org/a/mmCBfBdCFfcYCRBuTSe3kjCFs.svg)](https://asciinema.org/a/mmCBfBdCFfcYCRBuTSe3kjCFs)
 
+## Encrypting a whole directory
+
+The `pack` and `unpack` verbs work on directory trees instead of a single
+stream. `pack` recursively encrypts a source tree into a target tree, leaving
+the source plaintext untouched; `unpack` reverses it.
+
+```bash
+# Encrypt every file in ./data for Alice, mirroring the tree into ./vault
+$ crypt4gh pack --sk bob.sec --recipient_pk alice.pub ./data ./vault
+
+# Decrypt it back
+$ crypt4gh unpack --sk alice.sec ./vault ./restored
+```
+
+Options:
+
+* `--tar` bundles each top-level subdirectory into a single tar archive before
+  encryption (loose files at the root are still encrypted individually).
+* `--compress none|gzip|bzip2|zstd` compresses tarred subdirectories between
+  tarring and encryption, with an optional level (e.g. `--compress zstd:19`).
+  The default is `none` (genomic payloads are usually already compressed).
+* Source or destination may be a remote, rsync-style `[user@]host:/path`.
+  Ciphertext is staged in a local working directory (`--working`, default
+  `./crypt4gh-work` or `$C4GH_WORKDIR`) and moved with rsync over ssh; a remote
+  *source* is streamed over ssh so plaintext is never written to disk in transit.
+* `--jobs N` sets the number of parallel workers.
+
+Each run writes a SQLite catalog (`<working>/catalog.sqlite`) recording every
+item's size, mtime, mode and plaintext/ciphertext SHA-256 — used for integrity
+verification, and the basis for resumable runs.
+
 ## File Format
 
 Refer to the [specifications](http://samtools.github.io/hts-specs/crypt4gh.pdf) or this [documentation](https://crypt4gh.readthedocs.io/en/latest/encryption.html).
@@ -114,6 +145,25 @@ Finally, run
 ```
 pip install ./crypt4gh
 ```
+
+## Development with uv
+
+The project ships a `pyproject.toml` and a `uv.lock`. To set up a development
+environment and run the tests (Python 3.13+):
+
+```bash
+# Against a system-installed libsodium (recommended for development)
+export SODIUM_INSTALL=system
+export CFLAGS="$(pkg-config --cflags libsodium)"
+export LDFLAGS="$(pkg-config --libs libsodium)"
+
+uv sync                 # create the venv and build the C extension
+uv run pytest tests/unit    # Python unit tests
+bats tests                  # end-to-end tests (requires bats)
+```
+
+To build against the bundled libsodium instead, initialise the submodule
+(`git submodule update --init`) and drop `SODIUM_INSTALL=system`.
 
 ## Shell completions
 

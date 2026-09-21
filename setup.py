@@ -1,12 +1,20 @@
+"""Build shim for the libsodium C extension.
+
+All package metadata now lives in ``pyproject.toml``; this file exists only to
+build ``crypt4gh.sodium`` from ``crypt4gh/sodium.c``, either against a
+system-installed libsodium (``SODIUM_INSTALL=system``) or the bundled
+``libsodium-stable`` git submodule.
+"""
+
 import sys
-assert sys.version_info >= (3, 6), "setup.py requires python 3.6 or higher"
+assert sys.version_info >= (3, 13), "crypt4gh requires python 3.13 or higher"
 
 import os
 import subprocess
 from pathlib import Path
 import shutil
 
-from setuptools import setup, find_packages, Extension
+from setuptools import setup, Extension
 from setuptools.command.build_ext import build_ext
 
 _here = Path(__file__).parent
@@ -14,9 +22,9 @@ _here = Path(__file__).parent
 # Check for SODIUM_INSTALL environment variable
 use_system_sodium = os.environ.get('SODIUM_INSTALL') == 'system'
 
-include_dirs=[]
-library_dirs=[]
-libraries=[]
+include_dirs = []
+library_dirs = []
+libraries = []
 extra_compile_args = []
 extra_link_args = []
 
@@ -26,18 +34,19 @@ if not use_system_sodium:
     # Path to the built libsodium library
     LIBSODIUM_BUILD = _here / 'libsodium-build'
 
-    include_dirs=[str(LIBSODIUM_BUILD / 'include')]
-    library_dirs=[str(LIBSODIUM_BUILD / 'lib')]
-    libraries=['sodium']
+    include_dirs = [str(LIBSODIUM_BUILD / 'include')]
+    library_dirs = [str(LIBSODIUM_BUILD / 'lib')]
+    libraries = ['sodium']
     if sys.platform == "darwin":
-        extra_compile_args = ['-fPIC','-dead_strip']
-        extra_link_args = ['-fPIC','-dead_strip', '-Xlinker', '-dead_strip_dylibs']
+        extra_compile_args = ['-fPIC', '-dead_strip']
+        extra_link_args = ['-fPIC', '-dead_strip', '-Xlinker', '-dead_strip_dylibs']
     else:
         extra_compile_args = ['-fPIC', '-ffunction-sections', '-fdata-sections']
         extra_link_args = ['-fPIC', '-Wl,--as-needed', '-Wl,--gc-sections']
-        # on linux, gc-sections is too conservative and keeps more than needed 
+        # on linux, gc-sections is too conservative and keeps more than needed
         # the final C-extension will likely be bigger than needed: ¯\_(ツ)_/¯
         # On macos, the linker is more aggressive and makes a smaller shared object
+
 
 class BuildLibsodium(build_ext):
     def run(self):
@@ -54,7 +63,7 @@ CFLAGS and LDFLAGS may be needed.
         cmd = ['./configure',
                '--prefix', str(LIBSODIUM_BUILD),
                '--enable-minimal',
-               '--enable-opt', # since we install it on the machine
+               '--enable-opt',  # since we install it on the machine
                '--disable-shared',
                '--enable-static',
                '--enable-pic',
@@ -70,8 +79,10 @@ CFLAGS and LDFLAGS may be needed.
 
         super().run()
 
-class CleanLibsodium():
+
+class CleanLibsodium(build_ext):
     description = 'remove libsodium-build and crypt4gh/libs directories'
+
     def run(self):
         if use_system_sodium:
             return
@@ -83,78 +94,21 @@ class CleanLibsodium():
             print('Cleaning up', LIBSODIUM)
             subprocess.check_call(['make', 'clean'], cwd=str(LIBSODIUM))
 
-setup(name='crypt4gh',
-      version='1.8.6',
-      url='https://www.github.com/EGA-archive/crypt4gh',
-      license='Apache License 2.0',
-      author='Frédéric Haziza',
-      author_email='silverdaz@gmail.com',
-      description='GA4GH cryptographic utilities',
-      long_description=(_here / 'README.md').read_text(),
-      long_description_content_type='text/markdown',
-      packages=find_packages(),
-      include_package_data=True, # use MANIFEST.in
-      zip_safe=False,
-      entry_points={
-          'console_scripts': [
-              'crypt4gh=crypt4gh.__main__:main',
-              'crypt4gh-keygen=crypt4gh.keys.__main__:main',
-              'crypt4gh-completions=crypt4gh.completions.__main__:main',
-          ]
-      },
-      classifiers=[
-          'Development Status :: 5 - Production/Stable',
 
-          'Natural Language :: English',
-          'Operating System :: MacOS :: MacOS X',
-          'Operating System :: POSIX',
-          'Operating System :: POSIX :: BSD',
-          'Operating System :: POSIX :: Linux',
-          # 'Operating System :: Microsoft :: Windows',
-          
-          'Intended Audience :: Developers',
-          'Intended Audience :: Healthcare Industry',
-          'Intended Audience :: Information Technology',
-          'Topic :: Security :: Cryptography',
-          'Topic :: Scientific/Engineering :: Bio-Informatics',
-          'Topic :: Scientific/Engineering :: Medical Science Apps.',
-          
-          'Intended Audience :: Science/Research',
-          'Environment :: Console',
-          
-          'Programming Language :: Python :: Implementation :: CPython',
-          
-          'Programming Language :: Python :: 3',
-          'Programming Language :: Python :: 3 :: Only',
- 
-          'Programming Language :: Python :: 3.9',
-          'Programming Language :: Python :: 3.10',
-          'Programming Language :: Python :: 3.11',
-          'Programming Language :: Python :: 3.12',
-          'Programming Language :: Python :: 3.13',
-          'Programming Language :: Python :: 3.14',
-          # 'Programming Language :: Python :: 3.14t',
-      ],
-      python_requires='>=3.9',
-      # See https://packaging.python.org/discussions/install-requires-vs-requirements/
-      install_requires=[ # include version when needed
-          'docopt-ng', 
-          'cryptography>=2.8',
-          'bcrypt',
-      ],
-      cmdclass={
-          'build_ext': BuildLibsodium,
-          'clean': CleanLibsodium,
-      },
-      ext_modules=[
-          Extension(
-              'crypt4gh.sodium',
-              sources = ['crypt4gh/sodium.c'],
-              include_dirs = include_dirs,
-              library_dirs = library_dirs,
-              libraries = libraries,
-              extra_compile_args=extra_compile_args,
-              extra_link_args = extra_link_args
-          )
-      ],
+setup(
+    cmdclass={
+        'build_ext': BuildLibsodium,
+        'clean': CleanLibsodium,
+    },
+    ext_modules=[
+        Extension(
+            'crypt4gh.sodium',
+            sources=['crypt4gh/sodium.c'],
+            include_dirs=include_dirs,
+            library_dirs=library_dirs,
+            libraries=libraries,
+            extra_compile_args=extra_compile_args,
+            extra_link_args=extra_link_args,
+        )
+    ],
 )

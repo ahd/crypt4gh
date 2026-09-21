@@ -134,14 +134,22 @@ def make_packet_data_edit_list(edit_list):
             + b''.join( n.to_bytes(8,'little') for n in edit_list ))
 
 def validate_edit_list(edits):
-    '''Some (obvious) validation'''
+    '''Some (obvious) validation of a decoded edit list.
+
+    The edit list is a flat sequence of alternating skip/keep lengths, starting
+    with a skip.  Even indices (``edits[0::2]``) are skips, odd indices the
+    kept runs.
+    '''
+    edits = list(edits)
     if any(n < 0 for n in edits):
         raise ValueError('Invalid edit list: Cannot use negative numbers')
+    # A skip spanning a whole cipher segment would drop a data block entirely.
     if not all(skip < 2 * SEGMENT_SIZE - 1 for skip in edits[0::2]):
         raise ValueError('Invalid edit list: Data blocks will be ignored')
-    if not all(skip > edits[2::2]): # all but first
+    # The skips between reads (all but the first) must be non-zero.
+    if not all(skip > 0 for skip in edits[2::2]):
         raise ValueError('Invalid edit list: Cannot skip 0 bytes in between reads')
-    if not (edits[0] < SEGMENT_SIZE):
+    if edits and not (edits[0] < SEGMENT_SIZE):
         raise ValueError('Invalid edit list: First data block is ignored')
 
 def parse_edit_list_packet(packet):

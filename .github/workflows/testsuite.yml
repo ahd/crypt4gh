@@ -19,7 +19,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [macos-latest, ubuntu-latest]
-        python-version: ['3.9', '3.10', '3.11', '3.12', '3.13', '3.14']
+        python-version: ['3.13', '3.14']
         install: ['system', 'bundled']
 
     steps:
@@ -77,6 +77,12 @@ jobs:
       run: |
         sudo apt-get install -y bats
 
-    - name: Run tests
+    - name: Install pytest
+      run: pip install pytest
+
+    - name: Run unit tests
+      run: pytest tests/unit
+
+    - name: Run end-to-end tests
       run: |
         bats tests
