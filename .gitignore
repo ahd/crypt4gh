@@ -127,6 +127,8 @@ venv.bak/
 .beads/proxieddb/
 *.gate.lock*
 
-# Beads: share the issue export, ignore the local Dolt store + runtime files
+# Beads: durable state lives in the Dolt remote (refs/dolt/data on origin);
+# the whole .beads/ working area stays local. issues.jsonl is no longer tracked
+# (dropped 2026-09-22) — for human-readable backlog visibility we update the
+# README/CHANGELOG at intervals instead.
 .beads/*
-!.beads/issues.jsonl
