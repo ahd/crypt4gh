@@ -26,13 +26,55 @@ from .naming import parse_cipher_name
 LOG = logging.getLogger(__name__)
 
 
+def _prog(proc):
+    args = proc.args
+    return args[0] if isinstance(args, (list, tuple)) else str(args)
+
+
+def _kill(procs):
+    for p in procs:
+        try:
+            p.kill()
+        except Exception:
+            pass
+
+
+def _close(stream):
+    if stream is not None:
+        try:
+            stream.close()
+        except OSError:
+            pass
+
+
+def _unlink(path):
+    if path and os.path.exists(path):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
 def _reap(procs):
-    """Wait on subprocesses; raise if any exited non-zero."""
+    """Wait on subprocesses; raise if any exited non-zero.
+
+    ``tar`` exit code 1 ("some files differ / a file changed as we read it") is
+    tolerated with a warning: on live data a file may change mid-archive, which
+    does not invalidate the archive we produced.
+    """
     for p in procs:
         p.wait()
-    bad = [p for p in procs if p.returncode not in (0, None)]
+    bad = []
+    for p in procs:
+        if p.returncode in (0, None):
+            continue
+        if _prog(p) == 'tar' and p.returncode == 1:
+            LOG.warning('tar exited 1 (a file may have changed during read); continuing')
+            continue
+        bad.append(p)
     if bad:
-        raise ValueError('subprocess failed: ' + ', '.join(str(p.args) for p in bad))
+        raise ValueError('subprocess failed: ' + ', '.join(
+            f'{_prog(p)} (rc={p.returncode})' for p in bad))
 
 
 def pack_item(job):
@@ -41,6 +83,8 @@ def pack_item(job):
     relpath = entry['relpath']
     result = {'relpath': relpath, 'status': 'error', 'error': None}
     procs = []
+    raw = None
+    cipher_path = os.path.join(job['working_dir'], entry['cipher_relpath'])
     try:
         fs = source_fs(job['source_endpoint'])
         codec_name = entry.get('codec', 'none')
@@ -58,7 +102,6 @@ def pack_item(job):
         else:
             raise ValueError(f'pack_item cannot handle kind {entry["kind"]!r}')
 
-        cipher_path = os.path.join(job['working_dir'], entry['cipher_relpath'])
         os.makedirs(os.path.dirname(cipher_path) or '.', exist_ok=True)
 
         reader = HashingReader(raw)
@@ -67,7 +110,6 @@ def pack_item(job):
             job['cryptor'].encrypt_stream(reader, writer)
             writer.flush()
 
-        raw.close()
         _reap(procs)
 
         result.update(
@@ -79,12 +121,11 @@ def pack_item(job):
         )
     except Exception as e:  # keep one bad item from killing the whole run
         LOG.error('Failed to pack %s: %s', relpath, e)
-        for p in procs:
-            try:
-                p.kill()
-            except Exception:
-                pass
+        _kill(procs)
+        _unlink(cipher_path)   # don't leave a truncated ciphertext behind
         result['error'] = str(e)
+    finally:
+        _close(raw)
     return result
 
 
@@ -96,6 +137,8 @@ def unpack_item(job):
     out_root = job['out_root']
     result = {'relpath': relpath, 'status': 'error', 'error': None}
     procs = []
+    dest_file = None
+    kind = None
     try:
         kind = item['kind']
         codec_name = item.get('codec', 'none')
@@ -134,11 +177,9 @@ def unpack_item(job):
         result.update(status='done', plain_sha256=writer.hexdigest(), plain_size=writer.count)
     except Exception as e:
         LOG.error('Failed to unpack %s: %s', relpath, e)
-        for p in procs:
-            try:
-                p.kill()
-            except Exception:
-                pass
+        _kill(procs)
+        if kind == 'file':
+            _unlink(dest_file)   # remove the partial plaintext file
         result['error'] = str(e)
     return result
 

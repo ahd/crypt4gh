@@ -39,6 +39,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `crypt4gh.header.validate_edit_list` no longer raises `NameError` on the
   between-reads skip check and no longer `IndexError`s on an empty edit list.
   (The function was previously unreachable; it is now correct and unit-tested.)
+- `unpack` no longer mutates the source ciphertext directory: the catalog is
+  opened read-only + immutable, so decrypting a delivered tree leaves it
+  byte-for-byte unchanged and works even when the source is read-only.
+- `pack` no longer holds a SQLite connection open across the worker pool (a
+  forked child could finalise the inherited connection and corrupt the WAL); the
+  catalog is opened, written, and closed around each phase.
+- `pack`/`unpack` now abort *before* transporting when any item fails, instead of
+  pushing a known-incomplete set and then erroring.
+- The `pack`/`unpack` CLI reports transport/OS/SQLite errors cleanly instead of
+  dumping a traceback.
+- `tar` exit code 1 ("a file changed as we read it") is tolerated with a warning
+  rather than failing the item; error paths now close pipes and remove partial
+  outputs.
 
 ## [1.8.6]
 - Zsh completions; completions help/message updates.

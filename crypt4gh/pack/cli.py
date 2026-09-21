@@ -8,9 +8,11 @@ since these verbs carry many options.
 
 import os
 import sys
+import sqlite3
 import logging
 import argparse
 import functools
+import subprocess
 from getpass import getpass
 
 from .. import __version__, PROG
@@ -122,8 +124,8 @@ def main(argv):
             sender_pk = _load_pubkey(args.sender_pk) if args.sender_pk else None
             summary = api.unpack(args.source, args.dest, seckey=seckey,
                                  sender_pubkey=sender_pk, working_dir=args.working, jobs=args.jobs)
-    except ValueError as e:
-        print(e, file=sys.stderr)
+    except (ValueError, OSError, sqlite3.Error, subprocess.SubprocessError) as e:
+        print(f'{verb}: {e}', file=sys.stderr)
         sys.exit(1)
 
     print(f'{verb}: {summary["done"]} item(s) done, {summary["error"]} error(s)', file=sys.stderr)

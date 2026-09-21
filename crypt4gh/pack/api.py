@@ -10,6 +10,7 @@ round-trips byte-for-byte (permissions, mtimes, empty dirs and links included).
 import os
 import json
 import shutil
+import sqlite3
 import logging
 from concurrent.futures import ProcessPoolExecutor
 
@@ -92,22 +93,23 @@ def pack(source, dest, *, seckey, recipient_pubkeys, tar=False, compress='none',
         'tar': tar, 'compress': f'{codec_name}:{codec_level}' if codec_level else codec_name,
         'recipients': [pk.hex() for pk in recipient_pubkeys],
     }
-    catalog = Catalog(os.path.join(working, CATALOG_NAME))
-    run_id = catalog.start_run('pack', str(src), str(dst), options, __version__)
+    catalog_path = os.path.join(working, CATALOG_NAME)
 
-    # -- enumerate + record ------------------------------------------------
-    encryptable = []
-    for entry in _enumerate_pack(fs, tar, codec_name, codec_level):
-        if entry['kind'] in ('file', 'tar'):
-            entry['cipher_relpath'] = cipher_name(entry['relpath'], entry['kind'],
-                                                  entry.get('codec', 'none'))
-            entry['status'] = 'pending'
-            encryptable.append(entry)
-        else:
-            entry['status'] = 'done'  # dir / symlink: metadata only
-        catalog.add_item(run_id, entry)
+    # -- enumerate + record (close the DB before forking any workers) ------
+    with Catalog(catalog_path) as catalog:
+        run_id = catalog.start_run('pack', str(src), str(dst), options, __version__)
+        encryptable = []
+        for entry in _enumerate_pack(fs, tar, codec_name, codec_level):
+            if entry['kind'] in ('file', 'tar'):
+                entry['cipher_relpath'] = cipher_name(entry['relpath'], entry['kind'],
+                                                      entry.get('codec', 'none'))
+                entry['status'] = 'pending'
+                encryptable.append(entry)
+            else:
+                entry['status'] = 'done'  # dir / symlink: metadata only
+            catalog.add_item(run_id, entry)
 
-    # -- transform ---------------------------------------------------------
+    # -- transform (no DB connection is held open across the pool) ---------
     cryptor = LocalCryptor(seckey, recipient_pubkeys, sender_pubkey)
     njobs = _default_jobs(jobs)
     LOG.info('Packing %d item(s) with %d worker(s)', len(encryptable), njobs)
@@ -115,20 +117,22 @@ def pack(source, dest, *, seckey, recipient_pubkeys, tar=False, compress='none',
                  for e in encryptable]
     results = _run_pool(pack_item, jobs_list, njobs)
 
-    for r in results:
-        catalog.finish_item(run_id, r['relpath'], status=r['status'], error=r.get('error'),
-                            src_sha256=r.get('src_sha256'), src_size=r.get('src_size'),
-                            cipher_size=r.get('cipher_size'), cipher_sha256=r.get('cipher_sha256'))
+    # -- record results ----------------------------------------------------
+    with Catalog(catalog_path) as catalog:
+        for r in results:
+            catalog.finish_item(run_id, r['relpath'], status=r['status'], error=r.get('error'),
+                                src_sha256=r.get('src_sha256'), src_size=r.get('src_size'),
+                                cipher_size=r.get('cipher_size'), cipher_sha256=r.get('cipher_sha256'))
+        summary = _summarize(catalog, run_id)
 
-    summary = _summarize(catalog, run_id)
-    catalog.close()
+    # Abort before transporting a known-incomplete set.
+    _raise_on_failures(summary, 'pack')
 
     # -- transport ---------------------------------------------------------
     if dst.is_remote or (dst.kind == 'local' and os.path.abspath(dst.path) != working):
         LOG.info('Pushing staged ciphertext to %s', dst)
         transport.push(working, dst)
 
-    _raise_on_failures(summary, 'pack')
     return summary
 
 
@@ -177,7 +181,8 @@ def unpack(source, dest, *, seckey, sender_pubkey=None, working_dir=None, jobs=N
         out_root = os.path.join(working, 'plaintext')
     os.makedirs(out_root, exist_ok=True)
 
-    catalog, run_id, items = _load_unpack_items(cipher_dir)
+    # Read the source catalog read-only: unpack never mutates the ciphertext.
+    items = _load_unpack_items(cipher_dir)
 
     # Create empty dirs and symlinks first (shallow -> deep).
     _prepare_tree(out_root, items)
@@ -190,36 +195,36 @@ def unpack(source, dest, *, seckey, sender_pubkey=None, working_dir=None, jobs=N
                   'out_root': out_root, 'cryptor': cryptor} for it in encryptable]
     results = _run_pool(unpack_item, jobs_list, njobs)
 
-    if catalog:
-        for r in results:
-            catalog.finish_item(run_id, r['relpath'], status=r['status'], error=r.get('error'))
-
     # Restore directory permissions/mtimes last (deep -> shallow).
     _finalize_tree(out_root, items)
 
     summary = {'done': sum(r['status'] == 'done' for r in results),
                'error': sum(r['status'] == 'error' for r in results),
                'errors': [(r['relpath'], r['error']) for r in results if r['status'] == 'error']}
-    if catalog:
-        catalog.close()
+
+    # Abort before transporting a known-incomplete set.
+    _raise_on_failures(summary, 'unpack')
 
     if dst.is_remote:
         LOG.info('Pushing plaintext to %s', dst)
         transport.push(out_root, dst)
 
-    _raise_on_failures(summary, 'unpack')
     return summary
 
 
 def _load_unpack_items(cipher_dir):
-    """Prefer the catalog; fall back to scanning for *.c4gh files."""
+    """Read the item list from the source catalog (read-only); fall back to
+    scanning for *.c4gh files if there is no catalog."""
     cat_path = os.path.join(cipher_dir, CATALOG_NAME)
     if os.path.exists(cat_path):
-        catalog = Catalog(cat_path)
-        run = catalog.latest_run('pack')
-        if run:
-            return catalog, run['id'], catalog.items(run['id'])
-        catalog.close()
+        try:
+            with Catalog(cat_path, readonly=True) as catalog:
+                run = catalog.latest_run('pack')
+                if run:
+                    return catalog.items(run['id'])
+        except sqlite3.Error as e:
+            LOG.warning('Could not read catalog %s (%s); falling back to a filename scan',
+                        cat_path, e)
 
     LOG.warning('No catalog found in %s; reconstructing from filenames only '
                 '(empty dirs, symlinks and permissions will not be restored)', cipher_dir)
@@ -233,7 +238,7 @@ def _load_unpack_items(cipher_dir):
             items.append({'relpath': relpath, 'kind': kind, 'codec': codec,
                           'cipher_relpath': cipher_relpath, 'src_sha256': None,
                           'src_mode': None, 'src_mtime': None, 'symlink_target': None})
-    return None, None, items
+    return items
 
 
 def _prepare_tree(out_root, items):

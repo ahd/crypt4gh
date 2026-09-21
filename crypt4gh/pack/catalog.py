@@ -8,14 +8,19 @@ items already ``done`` whose source is unchanged) and for end-to-end integrity
 verification on ``unpack``.
 
 The catalog is owned and written by the orchestrator's main process only
-(workers return results which the main process records), so a single connection
-in WAL mode is all we need.
+(workers return results which the main process records).  The connection is
+never held open across a worker pool (a forked child could finalise an inherited
+SQLite connection and corrupt the WAL), so the orchestrator opens it, writes,
+and closes it around each phase.  ``unpack`` opens the *source* catalog
+``readonly=True`` so decrypting never mutates the delivered ciphertext.
 """
 
+import os
 import sqlite3
 import json
 import time
 import logging
+from urllib.request import pathname2url
 
 LOG = logging.getLogger(__name__)
 
@@ -65,8 +70,19 @@ CREATE INDEX IF NOT EXISTS item_status ON item(run_id, status);
 
 
 class Catalog:
-    def __init__(self, path):
+    def __init__(self, path, readonly=False):
         self.path = str(path)
+        self.readonly = readonly
+        if readonly:
+            # Open the database read-only and immutable, so reading a delivered
+            # ciphertext catalog never modifies it -- not even the -wal/-shm
+            # sidecars that a plain read-only open of a WAL database would create.
+            # (Our catalogs are always cleanly checkpointed on close, so there is
+            # no pending WAL for `immutable=1` to skip.)
+            uri = 'file:' + pathname2url(os.path.abspath(self.path)) + '?mode=ro&immutable=1'
+            self._db = sqlite3.connect(uri, uri=True)
+            self._db.row_factory = sqlite3.Row
+            return
         self._db = sqlite3.connect(self.path)
         self._db.row_factory = sqlite3.Row
         self._db.execute('PRAGMA journal_mode=WAL')
