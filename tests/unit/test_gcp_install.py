@@ -106,3 +106,90 @@ def test_ensure_installed_rejects_non_linux(monkeypatch):
     monkeypatch.setattr(g.platform, 'system', lambda: 'Darwin')
     with pytest.raises(g.InstallError, match='Linux-only'):
         g.ensure_installed(force=True)
+
+
+# ----------------------------------------------------------------------
+# usability flow: status / setup / start / ensure_usable (all mocked)
+# ----------------------------------------------------------------------
+@pytest.mark.parametrize('rc, out, expected', [
+    (0, 'Globus Online: connected\nTransfer Status: idle', True),
+    (0, 'No Globus Connect Personal connected to Globus Online Service', False),
+    (1, 'Globus Online: not connected', False),
+    (0, 'unexpected gibberish', False),
+])
+def test_is_connected_parses_status(monkeypatch, rc, out, expected):
+    monkeypatch.setattr(g, '_capture', lambda *a, **k: (rc, out))
+    assert g.is_connected('gcp') is expected
+
+
+def test_setup_requires_key():
+    with pytest.raises(g.InstallError, match='setup key is required'):
+        g.setup('gcp', '')
+
+
+def test_setup_passes_dir_and_key(monkeypatch, tmp_path):
+    seen = {}
+    monkeypatch.setattr(g, '_capture',
+                        lambda launcher, *a, config_dir=None: seen.update(args=a, dir=config_dir) or (0, ''))
+    g.setup('gcp', 'KEY123', config_dir=tmp_path)
+    assert seen['args'] == ('-setup', '--setup-key', 'KEY123')
+    assert seen['dir'] == tmp_path
+
+
+def test_start_waits_for_connected(monkeypatch, tmp_path):
+    # First status: not connected (triggers Popen); then connected.
+    states = iter([False, True])
+    monkeypatch.setattr(g, 'is_connected', lambda *a, **k: next(states))
+    popen = []
+    monkeypatch.setattr(g.subprocess, 'Popen', lambda cmd, **kw: popen.append(cmd))
+    monkeypatch.setattr(g.time, 'sleep', lambda _s: None)
+    g.start('gcp', config_dir=tmp_path, timeout=30)
+    assert popen and popen[0][-1] == '-start'
+
+
+def test_start_times_out(monkeypatch, tmp_path):
+    monkeypatch.setattr(g, 'is_connected', lambda *a, **k: False)
+    monkeypatch.setattr(g.subprocess, 'Popen', lambda cmd, **kw: None)
+    monkeypatch.setattr(g.time, 'sleep', lambda _s: None)
+    # Make the deadline elapse immediately.
+    t = iter([0.0, 100.0, 200.0])
+    monkeypatch.setattr(g.time, 'monotonic', lambda: next(t))
+    with pytest.raises(g.InstallError, match='did not report "connected"'):
+        g.start('gcp', config_dir=tmp_path, timeout=1)
+
+
+def test_create_setup_key_parses_json(monkeypatch):
+    monkeypatch.setattr(g.shutil, 'which', lambda _n: '/usr/bin/globus')
+
+    class _P:
+        stdout = '{"id": "EP-UUID", "globus_connect_setup_key": "KEY-XYZ"}'
+
+    monkeypatch.setattr(g.subprocess, 'run', lambda *a, **k: _P())
+    ep_id, key = g.create_setup_key('my-endpoint')
+    assert (ep_id, key) == ('EP-UUID', 'KEY-XYZ')
+
+
+def test_create_setup_key_needs_cli(monkeypatch):
+    monkeypatch.setattr(g.shutil, 'which', lambda _n: None)
+    with pytest.raises(g.InstallError, match='globus. CLI is needed'):
+        g.create_setup_key('x')
+
+
+def test_ensure_usable_noop_when_connected(monkeypatch):
+    monkeypatch.setattr(g, 'ensure_installed', lambda **k: 'gcp')
+    monkeypatch.setattr(g, 'is_connected', lambda *a, **k: True)
+    monkeypatch.setattr(g, 'setup', lambda *a, **k: pytest.fail('should not set up'))
+    launcher, ep_id = g.ensure_usable(config_dir=None)
+    assert launcher == 'gcp' and ep_id is None
+
+
+def test_ensure_usable_full_flow(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(g, 'ensure_installed', lambda **k: 'gcp')
+    monkeypatch.setattr(g, 'is_connected', lambda *a, **k: False)
+    monkeypatch.setattr(g, 'create_setup_key', lambda name: ('EP-UUID', 'KEY'))
+    monkeypatch.setattr(g, 'setup', lambda l, key, config_dir=None: calls.append(('setup', key)))
+    monkeypatch.setattr(g, 'start', lambda l, config_dir=None: calls.append(('start',)))
+    launcher, ep_id = g.ensure_usable(config_dir=tmp_path)  # tmp_path has no lta/client-id.txt
+    assert ep_id == 'EP-UUID'
+    assert calls == [('setup', 'KEY'), ('start',)]

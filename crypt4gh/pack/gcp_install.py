@@ -36,8 +36,11 @@ fully headless registration without it); pass it with ``--setup-key`` or run
 
 import os
 import sys
+import time
+import json
 import stat
 import shutil
+import socket
 import hashlib
 import logging
 import argparse
@@ -61,7 +64,17 @@ DEFAULT_SHARE_DIR = Path.home() / '.local' / 'share' / 'gcp'
 DEFAULT_BIN_DIR = Path.home() / '.local' / 'bin'
 LAUNCHER_NAME = 'globusconnectpersonal'
 
+#: A dedicated Globus config directory for the endpoint we stand up, kept apart
+#: from any pre-existing ``~/.globusonline`` so we never disturb an endpoint the
+#: user already registered.  Passed to the launcher with ``-dir``.  ``None`` means
+#: use the launcher's default (``~/.globusonline``).
+DEFAULT_CONFIG_DIR = DEFAULT_SHARE_DIR / 'config'
+
 _DOWNLOAD_CHUNK = 1 << 20  # 1 MiB
+
+#: How long to wait for a freshly started endpoint to report "connected".
+_START_TIMEOUT = 60
+_START_POLL = 3
 
 
 class InstallError(RuntimeError):
@@ -192,6 +205,145 @@ def _run_launcher(launcher, *args):
         raise InstallError(f'`{" ".join(cmd)}` failed: {exc}') from exc
 
 
+# ----------------------------------------------------------------------
+# make it *usable*: register (setup), start, and verify connectivity
+# ----------------------------------------------------------------------
+def _dir_args(config_dir):
+    """The ``-dir`` argument list for a non-default config dir (else empty)."""
+    return ['-dir', str(config_dir)] if config_dir else []
+
+
+def _capture(launcher, *args, config_dir=None):
+    """Run the launcher, capturing combined output; return (returncode, text)."""
+    cmd = [str(launcher), *_dir_args(config_dir), *args]
+    LOG.debug('running: %s', ' '.join(cmd))
+    try:
+        proc = subprocess.run(cmd, text=True, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT)
+    except OSError as exc:
+        raise InstallError(f'`{" ".join(cmd)}` could not run: {exc}') from exc
+    return proc.returncode, (proc.stdout or '')
+
+
+def is_connected(launcher, *, config_dir=None):
+    """True if a Globus Connect Personal instance is running *and* connected.
+
+    ``globusconnectpersonal -status`` prints "connected" for a live endpoint and
+    "No Globus Connect Personal connected to Globus Online Service" otherwise.
+    """
+    rc, out = _capture(launcher, '-status', config_dir=config_dir)
+    low = out.lower()
+    if 'no globus connect personal' in low or 'not connected' in low:
+        return False
+    return rc == 0 and 'connected' in low
+
+
+def setup(launcher, setup_key, *, config_dir=None):
+    """Register the endpoint with a one-time ``setup_key`` (idempotent-ish).
+
+    A config dir that is already set up makes ``-setup`` refuse; the caller
+    checks :func:`is_connected` first, so we pass ``-setup`` plainly here.
+    """
+    if not setup_key:
+        raise InstallError('a setup key is required to register the endpoint')
+    if config_dir:
+        Path(config_dir).mkdir(parents=True, exist_ok=True)
+    rc, out = _capture(launcher, '-setup', '--setup-key', setup_key, config_dir=config_dir)
+    if rc != 0:
+        raise InstallError(f'endpoint setup failed: {out.strip() or f"rc={rc}"}')
+    LOG.info('Endpoint registered%s', f' in {config_dir}' if config_dir else '')
+
+
+def start(launcher, *, config_dir=None, timeout=_START_TIMEOUT):
+    """Start the endpoint in the background and wait until it is connected."""
+    if is_connected(launcher, config_dir=config_dir):
+        LOG.info('Endpoint already connected')
+        return
+    log_path = Path(config_dir or DEFAULT_SHARE_DIR)
+    log_path.mkdir(parents=True, exist_ok=True)
+    logfile = log_path / 'gcp-start.log'
+    cmd = [str(launcher), *_dir_args(config_dir), '-start']
+    LOG.info('Starting endpoint: %s (log: %s)', ' '.join(cmd), logfile)
+    try:
+        with open(logfile, 'ab') as lf:
+            subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT,
+                             stdin=subprocess.DEVNULL, start_new_session=True)
+    except OSError as exc:
+        raise InstallError(f'could not start endpoint: {exc}') from exc
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if is_connected(launcher, config_dir=config_dir):
+            LOG.info('Endpoint connected')
+            return
+        time.sleep(_START_POLL)
+    raise InstallError(
+        f'endpoint did not report "connected" within {timeout}s; see {logfile}')
+
+
+def stop(launcher, *, config_dir=None):
+    """Stop a running endpoint (no error if it was not running)."""
+    _capture(launcher, '-stop', config_dir=config_dir)
+
+
+def create_setup_key(name, *, connector='personal'):
+    """Create a Globus endpoint via the ``globus`` CLI and return (id, setup_key).
+
+    Requires an authenticated ``globus`` CLI (``globus login``).  Kept isolated
+    so the exact CLI surface is easy to adjust per Globus CLI version.
+    """
+    if shutil.which('globus') is None:
+        raise InstallError(
+            'the `globus` CLI is needed to auto-create a setup key; either run '
+            '`globus login`, or pass --setup-key from '
+            'https://app.globus.org/collections?add')
+    argv = ['globus', 'endpoint', 'create', '--personal', name, '-F', 'json']
+    try:
+        out = subprocess.run(argv, check=True, text=True,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout
+    except (OSError, subprocess.SubprocessError) as exc:
+        detail = getattr(exc, 'stderr', '') or exc
+        raise InstallError(f'`globus endpoint create` failed: {detail}') from exc
+    try:
+        doc = json.loads(out)
+    except json.JSONDecodeError as exc:
+        raise InstallError(f'could not parse `globus endpoint create` output: {exc}') from exc
+    ep_id = doc.get('id') or doc.get('canonical_name')
+    key = doc.get('globus_connect_setup_key') or doc.get('setup_key')
+    if not ep_id or not key:
+        raise InstallError(f'setup key/endpoint id missing from response: {doc}')
+    return ep_id, key
+
+
+def ensure_usable(*, name=None, setup_key=None, config_dir=DEFAULT_CONFIG_DIR,
+                  url=DEFAULT_URL, share_dir=DEFAULT_SHARE_DIR, bin_dir=DEFAULT_BIN_DIR,
+                  expected_sha256=None, force_install=False):
+    """Install (if missing), register and start a *usable* GCP endpoint.
+
+    Returns ``(launcher_path, endpoint_id_or_None)``.  If a connected endpoint
+    already exists for ``config_dir`` this is a no-op.  A fresh registration
+    uses ``setup_key`` when given, else auto-creates one via the ``globus`` CLI.
+    """
+    launcher = ensure_installed(url=url, share_dir=share_dir, bin_dir=bin_dir,
+                                force=force_install, expected_sha256=expected_sha256)
+
+    if is_connected(launcher, config_dir=config_dir):
+        LOG.info('A connected Globus Connect Personal endpoint is already running')
+        return launcher, None
+
+    ep_id = None
+    already_setup = bool(config_dir) and (Path(config_dir) / 'lta' / 'client-id.txt').exists()
+    if not already_setup:
+        if not setup_key:
+            name = name or f'crypt4gh-{socket.gethostname()}'
+            LOG.info('Auto-creating a Globus endpoint %r via the globus CLI', name)
+            ep_id, setup_key = create_setup_key(name)
+        setup(launcher, setup_key, config_dir=config_dir)
+
+    start(launcher, config_dir=config_dir)
+    return launcher, ep_id
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         prog='crypt4gh-install-gcp',
@@ -210,13 +362,28 @@ def main(argv=None):
                         help='Expected SHA-256 of the tarball; abort on mismatch.')
     parser.add_argument('--force', action='store_true',
                         help='Reinstall even if globusconnectpersonal is on PATH.')
+    parser.add_argument('--ensure-usable', action='store_true',
+                        help='Install AND register AND start, then verify the endpoint '
+                             'is connected -- the one-shot "give me a working endpoint" path. '
+                             'Uses --setup-key if given, else auto-creates one via the '
+                             'authenticated `globus` CLI. No-op if already connected.')
+    parser.add_argument('--name', metavar='NAME',
+                        help='Display name for an auto-created endpoint '
+                             '(default: crypt4gh-<hostname>).')
+    parser.add_argument('--dir', dest='config_dir', type=Path, default=None,
+                        help='Globus config directory for this endpoint (passed as '
+                             '-dir). Default with --ensure-usable is '
+                             f'{DEFAULT_CONFIG_DIR}, kept apart from any existing '
+                             '~/.globusonline. Pass "" to use the launcher default.')
     parser.add_argument('--setup-key', metavar='KEY',
-                        help='After install, register the endpoint with this setup '
+                        help='Register the endpoint with this setup '
                              'key from https://app.globus.org/collections?add '
                              '(runs `globusconnectpersonal -setup --setup-key KEY`).')
     parser.add_argument('--start', action='store_true',
                         help='After install/setup, start the endpoint '
                              '(runs `globusconnectpersonal -start &`).')
+    parser.add_argument('--stop', action='store_true',
+                        help='Stop a running endpoint for --dir and exit.')
     parser.add_argument('-v', '--verbose', action='count', default=0,
                         help='Increase logging verbosity.')
     args = parser.parse_args(argv)
@@ -227,6 +394,33 @@ def main(argv=None):
     )
 
     try:
+        if args.stop:
+            installed = Path(args.bin_dir) / LAUNCHER_NAME
+            launcher = find_on_path() or (installed if installed.exists() else None)
+            if not launcher:
+                raise InstallError('no globusconnectpersonal found to stop')
+            stop(launcher, config_dir=(args.config_dir or None))
+            print('Stopped.', file=sys.stderr)
+            return 0
+
+        if args.ensure_usable:
+            config_dir = DEFAULT_CONFIG_DIR if args.config_dir is None else (args.config_dir or None)
+            launcher, ep_id = ensure_usable(
+                name=args.name, setup_key=args.setup_key, config_dir=config_dir,
+                url=args.url, share_dir=args.share_dir, bin_dir=args.bin_dir,
+                expected_sha256=args.sha256, force_install=args.force,
+            )
+            print('Globus Connect Personal is installed, registered and connected.',
+                  file=sys.stderr)
+            if ep_id:
+                print(f'  endpoint id: {ep_id}', file=sys.stderr)
+                print(f'  export C4GH_GLOBUS_LOCAL_ENDPOINT={ep_id}', file=sys.stderr)
+            if config_dir:
+                print(f'  config dir : {config_dir} '
+                      f'(manage with: {launcher} -dir {config_dir} -status|-stop)',
+                      file=sys.stderr)
+            return 0
+
         launcher = ensure_installed(
             url=args.url, share_dir=args.share_dir, bin_dir=args.bin_dir,
             force=args.force, expected_sha256=args.sha256,
@@ -239,9 +433,11 @@ def main(argv=None):
         print(f'error: {exc}', file=sys.stderr)
         return 1
 
-    if not args.setup_key:
+    if not (args.setup_key or args.start):
         print(
-            'Installed. Next, register the endpoint (one-time):\n'
+            'Installed the binary only. For a working endpoint in one step:\n'
+            f'  {sys.argv[0] if sys.argv else "crypt4gh-install-gcp"} --ensure-usable\n'
+            'or do it by hand:\n'
             '  1. Create a collection + setup key at '
             'https://app.globus.org/collections?add\n'
             f'  2. {launcher} -setup --setup-key <KEY>\n'
