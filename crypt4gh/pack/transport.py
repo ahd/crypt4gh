@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 """Endpoint parsing and at-rest transfer (local move / rsync-over-ssh).
 
-An endpoint is either a local path or an rsync-style ``[user@]host:/path``.
-The staged working directory is materialised locally first; this module then
-moves it to (or pulls it from) the endpoint.  A future ``globus`` kind slots in
-here: the "stage the lot, then push" model is exactly what Globus needs, since
-it transfers files at rest between endpoints.
+An endpoint is a local path, an rsync-style ``[user@]host:/path`` (ssh), or a
+``globus:<endpoint-id>:/path`` Globus collection.  The staged working directory
+is materialised locally first; this module then moves it to (or pulls it from)
+the endpoint.  The "stage the lot, then push" model is exactly what Globus needs,
+since GridFTP transfers files at rest between endpoints -- the local side is this
+host's Globus Connect Personal endpoint (see :mod:`crypt4gh.pack.globus`).
 """
 
 import os
@@ -21,12 +22,15 @@ LOG = logging.getLogger(__name__)
 # [user@]host:path  -- host has no slash and there is a colon before any slash.
 _REMOTE_RE = re.compile(r'^(?:(?P<user>[^@/]+)@)?(?P<host>[^@/:]+):(?P<path>.*)$')
 
+# globus:<endpoint-id>:/collection/path
+_GLOBUS_PREFIX = 'globus:'
+
 
 @dataclass
 class Endpoint:
     kind: str          # 'local' | 'ssh' | 'globus'
     path: str
-    host: str = None
+    host: str = None   # ssh hostname, or globus endpoint/collection id
     user: str = None
 
     @property
@@ -37,15 +41,27 @@ class Endpoint:
         if self.kind == 'ssh':
             host = f'{self.user}@{self.host}' if self.user else self.host
             return f'{host}:{self.path}'
+        if self.kind == 'globus':
+            return f'globus:{self.host}:{self.path}'
         return self.path
 
 
 def parse_endpoint(spec):
     """Parse a source/dest spec into an :class:`Endpoint`.
 
-    ``host:path`` is remote (ssh); anything else is a local path.  A bare
-    Windows-style drive letter is not a concern on the Linux target.
+    * ``globus:<endpoint-id>:/path`` is a Globus collection (checked first, so
+      the ssh regex does not mistake the ``globus`` prefix for a hostname).
+    * ``[user@]host:path`` is remote (ssh).
+    * anything else is a local path.  A bare Windows-style drive letter is not
+      a concern on the Linux target.
     """
+    if spec.startswith(_GLOBUS_PREFIX):
+        ep_id, sep, path = spec[len(_GLOBUS_PREFIX):].partition(':')
+        if not sep or not ep_id:
+            raise ValueError(
+                "Globus endpoint must be 'globus:<endpoint-id>:/path' "
+                f'(got {spec!r})')
+        return Endpoint(kind='globus', host=ep_id, path=path or '/')
     m = _REMOTE_RE.match(spec)
     if m:
         return Endpoint(kind='ssh', host=m.group('host'), user=m.group('user'),
@@ -69,6 +85,21 @@ def _ssh_mkdir(dest):
     subprocess.check_call(['ssh', _hostspec(dest), f'mkdir -p {shlex.quote(dest.path)}'])
 
 
+def _globus_endpoint_spec(working_dir):
+    """Address the local staging dir as ``<local-endpoint-id>:<abspath>``.
+
+    Warns (does not abort) if the dir is not on storage the local Globus
+    endpoint exposes: the transfer would then fail or crawl, but a mapped
+    collection may legitimately see paths we cannot introspect.
+    """
+    from . import globus
+    local_id = globus.local_endpoint_id()
+    ok, reason = globus.working_is_shared(working_dir)
+    if not ok:
+        LOG.warning('%s', reason)
+    return f'{local_id}:{os.path.abspath(working_dir)}'
+
+
 def push(working_dir, dest):
     """Move/copy the staged ciphertext (or plaintext) tree to the destination."""
     src = os.path.join(working_dir, '')  # trailing slash: copy contents
@@ -78,6 +109,10 @@ def push(working_dir, dest):
     elif dest.kind == 'ssh':
         _ssh_mkdir(dest)
         _rsync(src, f'{_hostspec(dest)}:{dest.path}/')
+    elif dest.kind == 'globus':
+        from . import globus
+        local = _globus_endpoint_spec(working_dir)
+        globus.transfer(local, f'{dest.host}:{dest.path}', label='crypt4gh pack')
     else:
         raise ValueError(f'Unsupported destination kind: {dest.kind}')
 
@@ -90,5 +125,9 @@ def pull(source, working_dir):
         _rsync(os.path.join(source.path, ''), dst)
     elif source.kind == 'ssh':
         _rsync(f'{_hostspec(source)}:{source.path}/', dst)
+    elif source.kind == 'globus':
+        from . import globus
+        local = _globus_endpoint_spec(working_dir)
+        globus.transfer(f'{source.host}:{source.path}', local, label='crypt4gh unpack')
     else:
         raise ValueError(f'Unsupported source kind: {source.kind}')

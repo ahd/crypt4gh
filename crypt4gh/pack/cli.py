@@ -65,8 +65,10 @@ def _add_common(p):
     p.add_argument('--jobs', '-j', type=int, default=0, metavar='N',
                    help='Number of parallel workers (default: min(cpu_count, 8))')
     p.add_argument('-v', '--verbose', action='count', default=0, help='Increase logging verbosity')
-    p.add_argument('source', help='Source directory (local path or [user@]host:/path)')
-    p.add_argument('dest', help='Destination directory (local path or [user@]host:/path)')
+    p.add_argument('source', help='Source directory: local path, [user@]host:/path (ssh), '
+                                  'or globus:<endpoint-id>:/path')
+    p.add_argument('dest', help='Destination directory: local path, [user@]host:/path (ssh), '
+                                'or globus:<endpoint-id>:/path')
 
 
 def _build_parser(verb):
