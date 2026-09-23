@@ -58,7 +58,7 @@ def _preflight_workdir(working):
 # pack
 # ----------------------------------------------------------------------
 def pack(source, dest, *, seckey, recipient_pubkeys, tar=False, compress='none',
-         working_dir=None, jobs=None, sender_pubkey=None):
+         working_dir=None, jobs=None, sender_pubkey=None, globus_options=None):
     """Encrypt a source tree into a destination tree.
 
     :returns: a summary dict (``done``/``error`` counts and byte totals).
@@ -131,7 +131,7 @@ def pack(source, dest, *, seckey, recipient_pubkeys, tar=False, compress='none',
     # -- transport ---------------------------------------------------------
     if dst.is_remote or (dst.kind == 'local' and os.path.abspath(dst.path) != working):
         LOG.info('Pushing staged ciphertext to %s', dst)
-        transport.push(working, dst)
+        transport.push(working, dst, globus=globus_options)
 
     return summary
 
@@ -156,7 +156,8 @@ def _enumerate_pack(fs, tar, codec_name, codec_level):
 # ----------------------------------------------------------------------
 # unpack
 # ----------------------------------------------------------------------
-def unpack(source, dest, *, seckey, sender_pubkey=None, working_dir=None, jobs=None):
+def unpack(source, dest, *, seckey, sender_pubkey=None, working_dir=None, jobs=None,
+           globus_options=None):
     """Decrypt a ciphertext tree into a plaintext tree."""
     src = transport.parse_endpoint(source)
     dst = transport.parse_endpoint(dest)
@@ -172,7 +173,7 @@ def unpack(source, dest, *, seckey, sender_pubkey=None, working_dir=None, jobs=N
         _preflight_workdir(working)
         cipher_dir = os.path.join(working, 'ciphertext')
         LOG.info('Pulling ciphertext from %s', src)
-        transport.pull(src, cipher_dir)
+        transport.pull(src, cipher_dir, globus=globus_options)
 
     # Output straight into a local dest; otherwise stage then push.
     if dst.kind == 'local':
@@ -207,7 +208,7 @@ def unpack(source, dest, *, seckey, sender_pubkey=None, working_dir=None, jobs=N
 
     if dst.is_remote:
         LOG.info('Pushing plaintext to %s', dst)
-        transport.push(out_root, dst)
+        transport.push(out_root, dst, globus=globus_options)
 
     return summary
 

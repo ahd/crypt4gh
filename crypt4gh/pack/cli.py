@@ -65,6 +65,21 @@ def _add_common(p):
     p.add_argument('--jobs', '-j', type=int, default=0, metavar='N',
                    help='Number of parallel workers (default: min(cpu_count, 8))')
     p.add_argument('-v', '--verbose', action='count', default=0, help='Increase logging verbosity')
+
+    g = p.add_argument_group('globus endpoint (only used for a globus: source/dest)')
+    g.add_argument('--globus-endpoint', metavar='ID',
+                   help='Pin the local Globus endpoint id (overrides '
+                        'C4GH_GLOBUS_LOCAL_ENDPOINT, the state file and CLI lookup).')
+    g.add_argument('--globus-config-dir', metavar='DIR',
+                   help='Config dir of the local Globus Connect Personal endpoint '
+                        '(passed as -dir; needed to start/share an isolated endpoint).')
+    g.add_argument('--globus-endpoint-name', metavar='NAME',
+                   help='Display name to use when auto-installing an endpoint.')
+    g.add_argument('--install-gcp', action='store_true',
+                   help='Auto-install and register a Globus Connect Personal endpoint '
+                        'if none is configured (also enabled by C4GH_GLOBUS_AUTO_INSTALL=1). '
+                        'Off by default: a missing endpoint is otherwise an error.')
+
     p.add_argument('source', help='Source directory: local path, [user@]host:/path (ssh), '
                                   'or globus:<endpoint-id>:/path')
     p.add_argument('dest', help='Destination directory: local path, [user@]host:/path (ssh), '
@@ -114,18 +129,30 @@ def main(argv):
     args = _build_parser(verb).parse_args(rest)
     _configure_logging(args.verbose)
 
+    # Endpoint-management options for a globus: leg (ignored for local/ssh).
+    # --install-gcp forces auto-install; without it, auto_install stays None so
+    # C4GH_GLOBUS_AUTO_INSTALL can still opt in.
+    globus_options = {
+        'endpoint_id': args.globus_endpoint,
+        'config_dir': args.globus_config_dir,
+        'name': args.globus_endpoint_name,
+        'auto_install': True if args.install_gcp else None,
+    }
+
     try:
         if verb == 'pack':
             seckey = _load_seckey(args.sk, generate=True)
             recipients = [_load_pubkey(pk) for pk in args.recipient_pk]
             summary = api.pack(args.source, args.dest, seckey=seckey,
                                recipient_pubkeys=recipients, tar=args.tar,
-                               compress=args.compress, working_dir=args.working, jobs=args.jobs)
+                               compress=args.compress, working_dir=args.working, jobs=args.jobs,
+                               globus_options=globus_options)
         else:
             seckey = _load_seckey(args.sk)
             sender_pk = _load_pubkey(args.sender_pk) if args.sender_pk else None
             summary = api.unpack(args.source, args.dest, seckey=seckey,
-                                 sender_pubkey=sender_pk, working_dir=args.working, jobs=args.jobs)
+                                 sender_pubkey=sender_pk, working_dir=args.working, jobs=args.jobs,
+                                 globus_options=globus_options)
     except (ValueError, OSError, sqlite3.Error, subprocess.SubprocessError) as e:
         print(f'{verb}: {e}', file=sys.stderr)
         sys.exit(1)

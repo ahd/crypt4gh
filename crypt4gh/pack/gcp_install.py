@@ -355,38 +355,54 @@ def setup(launcher, setup_key, *, config_dir=None):
     LOG.info('Endpoint registered%s', f' in {config_dir}' if config_dir else '')
 
 
-def start(launcher, *, config_dir=None, restrict_paths=None, timeout=_START_TIMEOUT):
-    """Start the endpoint in the background and wait until it is connected.
+def start(launcher, *, config_dir=None, restrict_paths=None, timeout=_START_TIMEOUT,
+          verify=None):
+    """Start the endpoint in the background and wait until it is usable.
 
     ``restrict_paths`` is a list of rules passed as ``-restrict-paths``; it takes
     effect only at start time and overrides any GUI-configured paths, so this is
     how an isolated ``-dir`` endpoint's shared paths are set.
+
+    ``verify`` is an optional zero-arg predicate for *true* reachability (e.g. a
+    transfer-API round-trip): local ``-status`` can report ``connected`` while
+    the Globus cloud still 502s for a few seconds, so when given, ``start`` polls
+    ``verify`` until it returns true (or ``timeout`` elapses) before returning.
     """
     if is_connected(launcher, config_dir=config_dir):
         LOG.info('Endpoint already connected')
-        return
-    log_path = Path(config_dir or DEFAULT_SHARE_DIR)
-    log_path.mkdir(parents=True, exist_ok=True)
-    logfile = log_path / 'gcp-start.log'
-    cmd = [str(launcher), *_dir_args(config_dir), '-start']
-    if restrict_paths:
-        cmd += ['-restrict-paths', ','.join(restrict_paths)]
-    LOG.info('Starting endpoint: %s (log: %s)', ' '.join(cmd), logfile)
-    try:
-        with open(logfile, 'ab') as lf:
-            subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT,
-                             stdin=subprocess.DEVNULL, start_new_session=True)
-    except OSError as exc:
-        raise InstallError(f'could not start endpoint: {exc}') from exc
+    else:
+        log_path = Path(config_dir or DEFAULT_SHARE_DIR)
+        log_path.mkdir(parents=True, exist_ok=True)
+        logfile = log_path / 'gcp-start.log'
+        cmd = [str(launcher), *_dir_args(config_dir), '-start']
+        if restrict_paths:
+            cmd += ['-restrict-paths', ','.join(restrict_paths)]
+        LOG.info('Starting endpoint: %s (log: %s)', ' '.join(cmd), logfile)
+        try:
+            with open(logfile, 'ab') as lf:
+                subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT,
+                                 stdin=subprocess.DEVNULL, start_new_session=True)
+        except OSError as exc:
+            raise InstallError(f'could not start endpoint: {exc}') from exc
 
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if is_connected(launcher, config_dir=config_dir):
-            LOG.info('Endpoint connected')
-            return
-        time.sleep(_START_POLL)
-    raise InstallError(
-        f'endpoint did not report "connected" within {timeout}s; see {logfile}')
+        deadline = time.monotonic() + timeout
+        while not is_connected(launcher, config_dir=config_dir):
+            if time.monotonic() >= deadline:
+                raise InstallError(
+                    f'endpoint did not report "connected" within {timeout}s; '
+                    f'see {logfile}')
+            time.sleep(_START_POLL)
+        LOG.info('Endpoint connected')
+
+    if verify is not None:
+        deadline = time.monotonic() + timeout
+        while not verify():
+            if time.monotonic() >= deadline:
+                raise InstallError(
+                    'endpoint reported connected but was not reachable via the '
+                    f'Globus transfer API within {timeout}s (GCDisconnected lag)')
+            time.sleep(_START_POLL)
+        LOG.info('Endpoint reachable via the Globus transfer API')
 
 
 def stop(launcher, *, config_dir=None):
@@ -394,24 +410,27 @@ def stop(launcher, *, config_dir=None):
     _capture(launcher, '-stop', config_dir=config_dir)
 
 
-def restart(launcher, *, config_dir=None, restrict_paths=None, timeout=_START_TIMEOUT):
+def restart(launcher, *, config_dir=None, restrict_paths=None, timeout=_START_TIMEOUT,
+            verify=None):
     """Stop then start the endpoint, applying ``restrict_paths``, and wait until
-    it is reconnected.
+    it is reconnected (and, if ``verify`` is given, actually reachable).
 
     Restarting is the only way to change an endpoint's accessible paths: GCP
     reads ``-restrict-paths`` at start time (verified by the ih8.2 spike).
     """
     stop(launcher, config_dir=config_dir)
-    start(launcher, config_dir=config_dir, restrict_paths=restrict_paths, timeout=timeout)
+    start(launcher, config_dir=config_dir, restrict_paths=restrict_paths,
+          timeout=timeout, verify=verify)
 
 
-def ensure_path_shared(launcher, endpoint_id, config_dir, path, *, state_path=None):
+def ensure_path_shared(launcher, endpoint_id, config_dir, path, *, state_path=None,
+                       verify=None):
     """Ensure ``path`` is reachable by the endpoint, restarting once if not.
 
     Idempotent: a no-op (returns ``False``) when ``path`` is already covered by
     the recorded rules.  Otherwise appends ``rw<realpath>`` to the current rules,
-    restarts the endpoint with the augmented set, records it in the state file,
-    and returns ``True``.
+    restarts the endpoint with the augmented set (waiting on ``verify`` for true
+    reachability), records it in the state file, and returns ``True``.
     """
     rules = current_restrict_paths(state_path=state_path)
     if restrict_path_covered(path, rules):
@@ -419,7 +438,7 @@ def ensure_path_shared(launcher, endpoint_id, config_dir, path, *, state_path=No
         return False
     new_rules = rules + ['rw' + os.path.realpath(path)]
     LOG.info('Sharing %s with the local Globus endpoint (restart)', path)
-    restart(launcher, config_dir=config_dir, restrict_paths=new_rules)
+    restart(launcher, config_dir=config_dir, restrict_paths=new_rules, verify=verify)
     save_endpoint_state(endpoint_id, config_dir, restrict_paths=new_rules, path=state_path)
     return True
 

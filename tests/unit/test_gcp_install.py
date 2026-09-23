@@ -302,7 +302,7 @@ def test_restart_stops_then_starts(monkeypatch):
     order = []
     monkeypatch.setattr(g, 'stop', lambda l, config_dir=None: order.append('stop'))
     monkeypatch.setattr(g, 'start',
-                        lambda l, config_dir=None, restrict_paths=None, timeout=None:
+                        lambda l, config_dir=None, restrict_paths=None, timeout=None, verify=None:
                         order.append(('start', restrict_paths)))
     g.restart('gcp', config_dir='/c', restrict_paths=['rw~/'])
     assert order == ['stop', ('start', ['rw~/'])]
@@ -336,3 +336,44 @@ def test_ensure_path_shared_noop_when_covered(monkeypatch, tmp_path):
                         lambda *a, **k: pytest.fail('must not restart when already shared'))
     changed = g.ensure_path_shared('gcp', 'EP', '/cfg', str(target / 'sub'), state_path=state)
     assert changed is False
+
+
+# ----------------------------------------------------------------------
+# start(verify=...) reachability wait (ih8.7)
+# ----------------------------------------------------------------------
+def test_start_verify_waits_then_succeeds(monkeypatch, tmp_path):
+    monkeypatch.setattr(g, 'is_connected', lambda *a, **k: True)   # already connected
+    monkeypatch.setattr(g.time, 'sleep', lambda _s: None)
+    monkeypatch.setattr(g.time, 'monotonic', lambda: 0.0)          # never times out
+    reach = iter([False, False, True])                            # 502 lag, then up
+    g.start('gcp', config_dir=tmp_path, verify=lambda: next(reach))  # returns cleanly
+
+
+def test_start_verify_times_out(monkeypatch, tmp_path):
+    monkeypatch.setattr(g, 'is_connected', lambda *a, **k: True)
+    monkeypatch.setattr(g.time, 'sleep', lambda _s: None)
+    monkeypatch.setattr(g.time, 'monotonic', iter([0.0, 100.0, 200.0]).__next__)
+    with pytest.raises(g.InstallError, match='not reachable via the Globus transfer API'):
+        g.start('gcp', config_dir=tmp_path, timeout=1, verify=lambda: False)
+
+
+def test_restart_passes_verify(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(g, 'stop', lambda l, config_dir=None: None)
+    monkeypatch.setattr(g, 'start',
+                        lambda l, config_dir=None, restrict_paths=None, timeout=None, verify=None:
+                        seen.update(verify=verify))
+    sentinel = lambda: True
+    g.restart('gcp', verify=sentinel)
+    assert seen['verify'] is sentinel
+
+
+def test_ensure_path_shared_passes_verify(monkeypatch, tmp_path):
+    seen = {}
+    monkeypatch.setattr(g, 'restart',
+                        lambda l, config_dir=None, restrict_paths=None, verify=None:
+                        seen.update(verify=verify))
+    sentinel = lambda: True
+    g.ensure_path_shared('gcp', 'EP', '/c', str(tmp_path / 'stage'),
+                         state_path=tmp_path / 'globus.json', verify=sentinel)
+    assert seen['verify'] is sentinel

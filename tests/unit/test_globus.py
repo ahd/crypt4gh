@@ -129,6 +129,21 @@ def test_submit_transfer_builds_argv(cli):
     assert argv[argv.index('-F') + 1] == 'json'
 
 
+def test_endpoint_reachable_true(cli):
+    assert globus.endpoint_reachable('EP') is True
+    assert cli[-1][1:] == ['ls', 'EP:/']  # probes the endpoint root via the API
+
+
+def test_endpoint_reachable_false_on_error(monkeypatch):
+    monkeypatch.setattr(globus.shutil, 'which', lambda _n: '/usr/bin/globus')
+
+    def boom(argv, **kw):
+        raise subprocess.CalledProcessError(1, argv, stderr='502 GCDisconnected')
+
+    monkeypatch.setattr(globus.subprocess, 'run', boom)
+    assert globus.endpoint_reachable('EP') is False
+
+
 def test_wait_builds_argv(cli):
     globus.wait('TASK-9', polling_interval=5, timeout=60)
     argv = cli[0]
@@ -198,6 +213,46 @@ def test_push_to_globus(monkeypatch, tmp_path):
     transport.push(str(tmp_path), dest)
     assert calls['src'] == f'LOCAL-EP:{os.path.realpath(str(tmp_path))}'  # realpath'd
     assert calls['dst'] == 'COLL-ID:/incoming/sub'
+
+
+def test_push_threads_globus_options(monkeypatch, tmp_path):
+    seen = {}
+    monkeypatch.setattr(transport, 'ensure_endpoint',
+                        lambda wd, **k: seen.update(k) or 'EP')
+    monkeypatch.setattr(globus, 'transfer', lambda *a, **k: None)
+    dest = transport.parse_endpoint('globus:COLL:/p')
+    opts = {'endpoint_id': 'PINNED', 'config_dir': '/c', 'name': 'nm', 'auto_install': True}
+    transport.push(str(tmp_path), dest, globus=opts)
+    assert seen == opts  # every knob reaches ensure_endpoint
+
+
+def test_pull_threads_globus_options(monkeypatch, tmp_path):
+    seen = {}
+    monkeypatch.setattr(transport, 'ensure_endpoint',
+                        lambda wd, **k: seen.update(k) or 'EP')
+    monkeypatch.setattr(globus, 'transfer', lambda *a, **k: None)
+    src = transport.parse_endpoint('globus:COLL:/p')
+    opts = {'endpoint_id': None, 'config_dir': None, 'name': None, 'auto_install': None}
+    transport.pull(src, str(tmp_path / 'w'), globus=opts)
+    assert seen == opts
+
+
+def test_cli_parses_globus_flags():
+    from crypt4gh.pack import cli
+    p = cli._build_parser('pack')
+    args = p.parse_args(['--recipient_pk', 'x.pub', '--install-gcp',
+                         '--globus-endpoint', 'EP', '--globus-config-dir', '/c',
+                         '--globus-endpoint-name', 'nm', 'srcd', 'dstd'])
+    assert args.install_gcp is True
+    assert (args.globus_endpoint, args.globus_config_dir, args.globus_endpoint_name) \
+        == ('EP', '/c', 'nm')
+
+
+def test_cli_globus_flags_default_off():
+    from crypt4gh.pack import cli
+    args = cli._build_parser('unpack').parse_args(['srcd', 'dstd'])
+    assert args.install_gcp is False
+    assert args.globus_endpoint is None and args.globus_config_dir is None
 
 
 def test_pull_from_globus(monkeypatch, tmp_path):
@@ -287,6 +342,18 @@ def test_ensure_endpoint_autoinstall_from_env(monkeypatch, ep):
                         lambda: (_ for _ in ()).throw(globus.GlobusError('none')))
     monkeypatch.setenv(transport.GLOBUS_AUTO_INSTALL_ENV, '1')
     assert transport.ensure_endpoint('/work') == 'NEW-EP'  # env opts into C
+
+
+def test_ensure_endpoint_verifies_reachability(monkeypatch, ep):
+    # ensure_endpoint must hand start/ensure_path_shared a verify() that probes
+    # the transfer API, so a transfer is not issued during the GCDisconnected lag.
+    reached = []
+    monkeypatch.setattr(globus, 'endpoint_reachable',
+                        lambda eid: reached.append(eid) or True)
+    monkeypatch.setattr(gcp_install, 'ensure_path_shared',
+                        lambda *a, verify=None, **k: bool(verify and verify()))
+    transport.ensure_endpoint('/work')
+    assert reached == ['EP']  # verify was actually invoked with the resolved id
 
 
 def test_ensure_endpoint_no_local_launcher_warns_only(monkeypatch, ep):

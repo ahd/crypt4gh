@@ -146,11 +146,17 @@ def ensure_endpoint(working_dir, *, auto_install=None, endpoint_id=None,
             LOG.warning('%s', reason)
         return endpoint_id
 
+    # Wait for a real transfer-API round-trip, not just local -status, after any
+    # (re)start: a freshly started endpoint can 502 (GCDisconnected) for seconds.
+    verify = lambda: globus.endpoint_reachable(endpoint_id)  # noqa: E731
+
     # A: share the working dir (restarts, so also brings a stopped endpoint up).
-    if not gcp_install.ensure_path_shared(launcher, endpoint_id, config_dir, working_dir):
-        # Already shared -- B: just make sure it is running.
+    if not gcp_install.ensure_path_shared(launcher, endpoint_id, config_dir,
+                                          working_dir, verify=verify):
+        # Already shared -- B: just make sure it is running (and reachable).
         gcp_install.start(launcher, config_dir=config_dir,
-                          restrict_paths=gcp_install.current_restrict_paths())
+                          restrict_paths=gcp_install.current_restrict_paths(),
+                          verify=verify)
     return endpoint_id
 
 
@@ -162,8 +168,13 @@ def _globus_local_spec(endpoint_id, working_dir):
     return f'{endpoint_id}:{os.path.realpath(working_dir)}'
 
 
-def push(working_dir, dest):
-    """Move/copy the staged ciphertext (or plaintext) tree to the destination."""
+def push(working_dir, dest, *, globus=None):
+    """Move/copy the staged ciphertext (or plaintext) tree to the destination.
+
+    ``globus`` is an optional dict of endpoint-management options (endpoint_id,
+    config_dir, name, auto_install) forwarded to :func:`ensure_endpoint` on a
+    globus leg; ignored for local/ssh destinations.
+    """
     src = os.path.join(working_dir, '')  # trailing slash: copy contents
     if dest.kind == 'local':
         os.makedirs(dest.path, exist_ok=True)
@@ -172,16 +183,20 @@ def push(working_dir, dest):
         _ssh_mkdir(dest)
         _rsync(src, f'{_hostspec(dest)}:{dest.path}/')
     elif dest.kind == 'globus':
-        from . import globus
-        endpoint_id = ensure_endpoint(working_dir)
+        from . import globus as globus_mod
+        endpoint_id = ensure_endpoint(working_dir, **(globus or {}))
         local = _globus_local_spec(endpoint_id, working_dir)
-        globus.transfer(local, f'{dest.host}:{dest.path}', label='crypt4gh pack')
+        globus_mod.transfer(local, f'{dest.host}:{dest.path}', label='crypt4gh pack')
     else:
         raise ValueError(f'Unsupported destination kind: {dest.kind}')
 
 
-def pull(source, working_dir):
-    """Fetch an at-rest tree (e.g. ciphertext for unpack) into the working dir."""
+def pull(source, working_dir, *, globus=None):
+    """Fetch an at-rest tree (e.g. ciphertext for unpack) into the working dir.
+
+    ``globus`` is forwarded to :func:`ensure_endpoint` on a globus leg (see
+    :func:`push`); ignored for local/ssh sources.
+    """
     os.makedirs(working_dir, exist_ok=True)
     dst = os.path.join(working_dir, '')
     if source.kind == 'local':
@@ -189,9 +204,9 @@ def pull(source, working_dir):
     elif source.kind == 'ssh':
         _rsync(f'{_hostspec(source)}:{source.path}/', dst)
     elif source.kind == 'globus':
-        from . import globus
-        endpoint_id = ensure_endpoint(working_dir)
+        from . import globus as globus_mod
+        endpoint_id = ensure_endpoint(working_dir, **(globus or {}))
         local = _globus_local_spec(endpoint_id, working_dir)
-        globus.transfer(f'{source.host}:{source.path}', local, label='crypt4gh unpack')
+        globus_mod.transfer(f'{source.host}:{source.path}', local, label='crypt4gh unpack')
     else:
         raise ValueError(f'Unsupported source kind: {source.kind}')

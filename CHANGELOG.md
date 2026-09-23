@@ -35,9 +35,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`C4GH_GLOBUS_LOCAL_ENDPOINT` → state file `~/.config/crypt4gh/globus.json` →
   `globus endpoint local-id`), starts it if it is not connected, and shares the
   working directory via GCP `-restrict-paths` (restarting once if needed) so
-  GridFTP can reach the staged bytes. Installing a brand-new endpoint on the fly
-  is opt-in (`C4GH_GLOBUS_AUTO_INSTALL=1`); otherwise a missing endpoint is a
-  clear error pointing at `crypt4gh-install-gcp --ensure-usable`.
+  GridFTP can reach the staged bytes. After any (re)start it waits for a real
+  transfer-API round-trip — not just local `-status`, which can report
+  `connected` while the Globus cloud still 502s (`GCDisconnected`) for a few
+  seconds — before issuing the transfer. Installing a brand-new endpoint on the fly
+  is opt-in (`C4GH_GLOBUS_AUTO_INSTALL=1` or `--install-gcp`); otherwise a
+  missing endpoint is a clear error pointing at
+  `crypt4gh-install-gcp --ensure-usable`. `pack`/`unpack` also accept
+  `--globus-endpoint`, `--globus-config-dir` and `--globus-endpoint-name` to pin
+  or name the local endpoint.
 - **`crypt4gh-install-gcp`** (`crypt4gh.pack.gcp_install`): a Linux-only,
   stdlib-only per-user installer for Globus Connect Personal. Downloads the
   closed-source vendor tarball (not vendored into the repo) to

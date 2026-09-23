@@ -103,6 +103,22 @@ def local_endpoint_id():
     return resolve_local_endpoint()[0]
 
 
+def endpoint_reachable(endpoint_id):
+    """True if ``endpoint_id`` answers a transfer-API round-trip right now.
+
+    A freshly (re)started Globus Connect Personal endpoint can report
+    ``connected`` locally while the Globus cloud still returns 502
+    ``GCDisconnected`` for a few seconds (ih8.2 spike, Q4).  A real ``globus ls``
+    on the endpoint root is the authoritative signal, so callers can poll this
+    after a start/restart before issuing a transfer.
+    """
+    try:
+        _run(['ls', f'{endpoint_id}:/'])
+        return True
+    except GlobusError:
+        return False
+
+
 def submit_transfer(src, dst, *, recursive=True, sync_level='checksum', label=None):
     """Submit a transfer ``src`` -> ``dst`` and return its task id.
 
