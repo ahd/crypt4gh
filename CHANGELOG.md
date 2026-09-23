@@ -26,13 +26,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - permissions, mtimes, empty directories and symlinks are preserved.
 - Pluggable crypto and transport layers, so an encrypt-at-source mode and a
   Globus transport backend can be added without changing the pipeline.
+- **Globus transport** (`globus:<endpoint-id>:/path`) for either the source or
+  destination of `pack`/`unpack`. Ciphertext is staged locally, then moved at
+  rest with GridFTP by shelling out to the `globus` CLI (`globus transfer` +
+  `globus task wait`).
+- **Self-managing local endpoint.** Before a `globus:` transfer, crypt4gh
+  resolves this host's Globus Connect Personal endpoint
+  (`C4GH_GLOBUS_LOCAL_ENDPOINT` → state file `~/.config/crypt4gh/globus.json` →
+  `globus endpoint local-id`), starts it if it is not connected, and shares the
+  working directory via GCP `-restrict-paths` (restarting once if needed) so
+  GridFTP can reach the staged bytes. Installing a brand-new endpoint on the fly
+  is opt-in (`C4GH_GLOBUS_AUTO_INSTALL=1`); otherwise a missing endpoint is a
+  clear error pointing at `crypt4gh-install-gcp --ensure-usable`.
 - **`crypt4gh-install-gcp`** (`crypt4gh.pack.gcp_install`): a Linux-only,
-  stdlib-only per-user installer for Globus Connect Personal, groundwork for the
-  forthcoming Globus transport. Downloads the closed-source vendor tarball (not
-  vendored into the repo) to `~/.local/share/gcp/` and links the launcher at
+  stdlib-only per-user installer for Globus Connect Personal. Downloads the
+  closed-source vendor tarball (not vendored into the repo) to
+  `~/.local/share/gcp/` and links the launcher at
   `~/.local/bin/globusconnectpersonal`; a no-op when one is already on `PATH`.
   Verifies the download against an optional pinned `--sha256`, rejects unsafe
   archives, and can register (`--setup-key`) and start (`--start`) the endpoint.
+  `--ensure-usable` does the lot in one shot (install, register, start, verify
+  connected) and records the endpoint in the state file for the transport.
 - A `pytest` unit-test suite under `tests/unit/` (crypto/header, key formats,
   KDFs, naming, codecs, catalog, transport parsing, and pack/unpack round-trips).
 

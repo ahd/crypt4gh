@@ -193,11 +193,146 @@ def test_ensure_usable_noop_when_connected(monkeypatch):
 
 def test_ensure_usable_full_flow(monkeypatch, tmp_path):
     calls = []
+    monkeypatch.setenv('XDG_CONFIG_HOME', str(tmp_path / 'xdg'))  # isolate the state file
     monkeypatch.setattr(g, 'ensure_installed', lambda **k: 'gcp')
     monkeypatch.setattr(g, 'is_connected', lambda *a, **k: False)
     monkeypatch.setattr(g, 'create_setup_key', lambda name: ('EP-UUID', 'KEY'))
     monkeypatch.setattr(g, 'setup', lambda l, key, config_dir=None: calls.append(('setup', key)))
     monkeypatch.setattr(g, 'start', lambda l, config_dir=None: calls.append(('start',)))
-    launcher, ep_id = g.ensure_usable(config_dir=tmp_path)  # tmp_path has no lta/client-id.txt
+    cfg = tmp_path / 'cfg'  # config_dir with no lta/client-id.txt -> fresh registration
+    launcher, ep_id = g.ensure_usable(config_dir=cfg)
     assert ep_id == 'EP-UUID'
     assert calls == [('setup', 'KEY'), ('start',)]
+    # ...and the created endpoint (with its config dir) was persisted for the transport.
+    assert g.load_endpoint_state() == {'endpoint_id': 'EP-UUID', 'config_dir': str(cfg)}
+
+
+# ----------------------------------------------------------------------
+# endpoint state file (save/load)
+# ----------------------------------------------------------------------
+def test_state_roundtrip(tmp_path):
+    p = tmp_path / 'globus.json'
+    g.save_endpoint_state('EP-1', '/some/cfg', path=p)
+    assert g.load_endpoint_state(path=p) == {'endpoint_id': 'EP-1', 'config_dir': '/some/cfg'}
+
+
+def test_state_omits_config_dir_when_none(tmp_path):
+    p = tmp_path / 'globus.json'
+    g.save_endpoint_state('EP-1', None, path=p)
+    assert g.load_endpoint_state(path=p) == {'endpoint_id': 'EP-1'}
+
+
+def test_state_path_honours_xdg(monkeypatch, tmp_path):
+    monkeypatch.setenv('XDG_CONFIG_HOME', str(tmp_path / 'xdg'))
+    assert g._state_path() == tmp_path / 'xdg' / 'crypt4gh' / 'globus.json'
+
+
+def test_load_endpoint_state_missing_is_none(tmp_path):
+    assert g.load_endpoint_state(path=tmp_path / 'nope.json') is None
+
+
+def test_load_endpoint_state_corrupt_is_none(tmp_path):
+    p = tmp_path / 'globus.json'
+    p.write_text('{not json')
+    assert g.load_endpoint_state(path=p) is None
+
+
+def test_load_endpoint_state_without_id_is_none(tmp_path):
+    p = tmp_path / 'globus.json'
+    p.write_text('{"config_dir": "/x"}')
+    assert g.load_endpoint_state(path=p) is None
+
+
+def test_save_endpoint_state_swallows_io_error(monkeypatch):
+    # An unwritable location must warn, not raise (state is a convenience).
+    def boom(*a, **k):
+        raise OSError('nope')
+    monkeypatch.setattr(g.Path, 'mkdir', boom)
+    g.save_endpoint_state('EP-1', '/c', path='/root/denied/globus.json')  # no exception
+
+
+# ----------------------------------------------------------------------
+# restrict-paths parsing / coverage
+# ----------------------------------------------------------------------
+def test_restrict_rule_path_parses_access(tmp_path):
+    access, path = g.restrict_rule_path('rw' + str(tmp_path))
+    assert access == 'rw' and path == os.path.realpath(str(tmp_path))
+    assert g.restrict_rule_path('r/pub') == ('r', '/pub')
+    assert g.restrict_rule_path('/pub')[0] == 'rw'  # no prefix => rw
+
+
+def test_restrict_path_covered_prefix(tmp_path):
+    rules = ['rw' + str(tmp_path)]
+    assert g.restrict_path_covered(str(tmp_path / 'a' / 'b'), rules)
+    assert not g.restrict_path_covered('/somewhere/else', rules)
+
+
+def test_restrict_path_covered_longest_match_n_denies(tmp_path):
+    deep = tmp_path / 'deep'
+    rules = ['rw' + str(tmp_path), 'n' + str(deep)]
+    assert g.restrict_path_covered(str(tmp_path / 'x'), rules)      # broad grant
+    assert not g.restrict_path_covered(str(deep / 'x'), rules)      # specific N wins
+
+
+def test_current_restrict_paths_defaults_to_home(tmp_path):
+    assert g.current_restrict_paths(state_path=tmp_path / 'nope.json') == [g.HOME_RULE]
+
+
+def test_current_restrict_paths_from_state(tmp_path):
+    state = tmp_path / 'globus.json'
+    g.save_endpoint_state('EP', '/c', restrict_paths=['rw/x'], path=state)
+    assert g.current_restrict_paths(state_path=state) == ['rw/x']
+
+
+# ----------------------------------------------------------------------
+# start(restrict_paths) / restart / ensure_path_shared
+# ----------------------------------------------------------------------
+def test_start_passes_restrict_paths(monkeypatch, tmp_path):
+    seen = {}
+    states = iter([False, True])  # top guard: not connected; then: connected
+    monkeypatch.setattr(g, 'is_connected', lambda *a, **k: next(states))
+    monkeypatch.setattr(g.subprocess, 'Popen',
+                        lambda cmd, **kw: seen.update(cmd=cmd) or object())
+    g.start('gcp', config_dir=tmp_path, restrict_paths=['rw~/', 'rw/mnt/x'])
+    cmd = seen['cmd']
+    assert cmd[cmd.index('-restrict-paths') + 1] == 'rw~/,rw/mnt/x'
+
+
+def test_restart_stops_then_starts(monkeypatch):
+    order = []
+    monkeypatch.setattr(g, 'stop', lambda l, config_dir=None: order.append('stop'))
+    monkeypatch.setattr(g, 'start',
+                        lambda l, config_dir=None, restrict_paths=None, timeout=None:
+                        order.append(('start', restrict_paths)))
+    g.restart('gcp', config_dir='/c', restrict_paths=['rw~/'])
+    assert order == ['stop', ('start', ['rw~/'])]
+
+
+def test_ensure_path_shared_shares_and_restarts(monkeypatch, tmp_path):
+    state = tmp_path / 'globus.json'
+    calls = []
+    monkeypatch.setattr(g, 'restart',
+                        lambda launcher, config_dir=None, restrict_paths=None, **k:
+                        calls.append((config_dir, restrict_paths)))
+    target = tmp_path / 'stage'
+    changed = g.ensure_path_shared('gcp', 'EP', '/cfg', str(target), state_path=state)
+    assert changed is True
+    assert len(calls) == 1                       # exactly one restart
+    cfg, rules = calls[0]
+    assert cfg == '/cfg'
+    assert g.HOME_RULE in rules                  # home preserved
+    assert 'rw' + os.path.realpath(str(target)) in rules  # target added (canonical)
+    # the augmented rule set was persisted for next time
+    assert g.load_endpoint_state(path=state)['restrict_paths'] == rules
+
+
+def test_ensure_path_shared_noop_when_covered(monkeypatch, tmp_path):
+    state = tmp_path / 'globus.json'
+    target = tmp_path / 'stage'
+    g.save_endpoint_state('EP', '/cfg',
+                          restrict_paths=['rw' + os.path.realpath(str(target))],
+                          path=state)
+    monkeypatch.setattr(g, 'restart',
+                        lambda *a, **k: pytest.fail('must not restart when already shared'))
+    changed = g.ensure_path_shared('gcp', 'EP', '/cfg', str(target / 'sub'), state_path=state)
+    assert changed is False

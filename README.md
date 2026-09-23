@@ -110,13 +110,55 @@ Each run writes a SQLite catalog (`<working>/catalog.sqlite`) recording every
 item's size, mtime, mode and plaintext/ciphertext SHA-256 — used for integrity
 verification, and the basis for resumable runs.
 
+### Globus endpoints (`globus:` transport)
+
+Either the source or the destination may be a Globus collection, addressed as
+`globus:<endpoint-id>:/path`:
+
+```bash
+# pack a tree and push the ciphertext to a Globus collection
+crypt4gh pack ./data globus:<COLLECTION-ID>:/incoming --recipient-pk bob.pub
+
+# pull ciphertext from a collection and unpack it locally
+crypt4gh unpack globus:<COLLECTION-ID>:/incoming ./out --sk mysecret.key
+```
+
+Globus moves files *at rest* between two endpoints, so the local side of the
+transfer is this host's Globus Connect Personal (GCP) endpoint. crypt4gh manages
+that endpoint for you: before a `globus:` transfer it resolves the local
+endpoint, **starts it if it is not running**, and **shares the working directory**
+(via GCP `-restrict-paths`, restarting once if needed) so GridFTP can reach the
+staged ciphertext. The endpoint is discovered in this order:
+
+1. `C4GH_GLOBUS_LOCAL_ENDPOINT=<endpoint-id>` (explicit override);
+2. the state file `~/.config/crypt4gh/globus.json` written by
+   `crypt4gh-install-gcp --ensure-usable` (records the endpoint id, its config
+   dir, and shared paths — the only way to find an isolated `-dir` endpoint);
+3. `globus endpoint local-id` (the default GCP endpoint).
+
+If none is configured, crypt4gh stops with a clear error rather than guessing —
+unless you opt into auto-install with `C4GH_GLOBUS_AUTO_INSTALL=1`, which lets it
+install and register a fresh endpoint on the spot.
+
+> **Speed note.** GridFTP throughput needs a data-transfer server at *both* ends,
+> so `--working` must live on storage the local endpoint exposes. crypt4gh shares
+> the working directory automatically; if it sits on storage no reachable
+> collection can see, the transfer would otherwise fall back or fail, and you are
+> warned.
+
 ### Installing Globus Connect Personal (Linux)
 
-A forthcoming Globus transport can move the staged ciphertext between Globus
-collections. If the remote already exposes a Globus collection you need install
-nothing locally; otherwise you can stand up a transient personal endpoint.
+If the remote already exposes a Globus collection you need install nothing
+locally; otherwise stand up a transient personal endpoint. The one-shot path
+installs, registers and starts a connected endpoint (and records it in the state
+file above):
+
+```bash
+crypt4gh-install-gcp --ensure-usable
+```
+
 Globus Connect Personal is closed-source vendor software (~100 MB), so it is not
-bundled here — install a per-user copy with:
+bundled here. To install only the binary:
 
 ```bash
 crypt4gh-install-gcp            # or: python -m crypt4gh.pack.gcp_install

@@ -85,19 +85,81 @@ def _ssh_mkdir(dest):
     subprocess.check_call(['ssh', _hostspec(dest), f'mkdir -p {shlex.quote(dest.path)}'])
 
 
-def _globus_endpoint_spec(working_dir):
-    """Address the local staging dir as ``<local-endpoint-id>:<abspath>``.
+#: Opt into auto-installing a brand-new endpoint when none is configured.
+GLOBUS_AUTO_INSTALL_ENV = 'C4GH_GLOBUS_AUTO_INSTALL'
 
-    Warns (does not abort) if the dir is not on storage the local Globus
-    endpoint exposes: the transfer would then fail or crawl, but a mapped
-    collection may legitimately see paths we cannot introspect.
+
+def _env_flag(name):
+    return os.getenv(name, '').strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+def ensure_endpoint(working_dir, *, auto_install=None, endpoint_id=None,
+                    config_dir=None, name=None):
+    """Make the local Globus endpoint ready to transfer ``working_dir``.
+
+    Orchestrates, in order:
+
+    * **resolve** the local endpoint id + config dir (explicit args win, else
+      env override / state file / ``globus endpoint local-id``);
+    * **C** -- if nothing resolved: install+register a fresh endpoint, but only
+      when ``auto_install`` is set (defaults to the
+      :data:`GLOBUS_AUTO_INSTALL_ENV` env flag); otherwise raise a clear error;
+    * **A** -- ensure ``working_dir`` is shared (restarts once if not), and
+    * **B** -- start the endpoint if it is not already connected.
+
+    :returns: the resolved endpoint id (to address the local side of the
+        transfer).
     """
-    from . import globus
-    local_id = globus.local_endpoint_id()
-    ok, reason = globus.working_is_shared(working_dir)
-    if not ok:
-        LOG.warning('%s', reason)
-    return f'{local_id}:{os.path.abspath(working_dir)}'
+    from . import globus, gcp_install
+    if auto_install is None:
+        auto_install = _env_flag(GLOBUS_AUTO_INSTALL_ENV)
+
+    if endpoint_id is None:
+        try:
+            endpoint_id, resolved_cfg = globus.resolve_local_endpoint()
+        except globus.GlobusError:
+            endpoint_id, resolved_cfg = None, None
+        if config_dir is None:
+            config_dir = resolved_cfg
+
+    if not endpoint_id:
+        if not auto_install:
+            raise globus.GlobusError(
+                'no local Globus endpoint is configured. Run '
+                '`crypt4gh-install-gcp --ensure-usable` once, set '
+                f'{globus.LOCAL_ENDPOINT_ENV}=<endpoint-id>, or enable '
+                f'auto-install ({GLOBUS_AUTO_INSTALL_ENV}=1 / --install-gcp).')
+        if config_dir is None:
+            config_dir = str(gcp_install.DEFAULT_CONFIG_DIR)
+        LOG.info('No local Globus endpoint configured; auto-installing one')
+        _launcher, endpoint_id = gcp_install.ensure_usable(name=name, config_dir=config_dir)
+        if not endpoint_id:  # a pre-existing connected endpoint: re-resolve its id
+            endpoint_id, cfg2 = globus.resolve_local_endpoint()
+            config_dir = config_dir or cfg2
+
+    launcher = gcp_install.find_on_path()
+    if launcher is None:
+        # A managed collection / DTN we do not run locally: cannot manage its
+        # lifecycle, so only warn if we can tell the dir is not reachable.
+        ok, reason = globus.working_is_shared(working_dir)
+        if not ok:
+            LOG.warning('%s', reason)
+        return endpoint_id
+
+    # A: share the working dir (restarts, so also brings a stopped endpoint up).
+    if not gcp_install.ensure_path_shared(launcher, endpoint_id, config_dir, working_dir):
+        # Already shared -- B: just make sure it is running.
+        gcp_install.start(launcher, config_dir=config_dir,
+                          restrict_paths=gcp_install.current_restrict_paths())
+    return endpoint_id
+
+
+def _globus_local_spec(endpoint_id, working_dir):
+    """Address the local staging dir as ``<endpoint-id>:<realpath>``.
+
+    Realpath (not just abspath) because GCP canonicalises the addressed path
+    before applying its ``-restrict-paths`` rules (ih8.2 spike)."""
+    return f'{endpoint_id}:{os.path.realpath(working_dir)}'
 
 
 def push(working_dir, dest):
@@ -111,7 +173,8 @@ def push(working_dir, dest):
         _rsync(src, f'{_hostspec(dest)}:{dest.path}/')
     elif dest.kind == 'globus':
         from . import globus
-        local = _globus_endpoint_spec(working_dir)
+        endpoint_id = ensure_endpoint(working_dir)
+        local = _globus_local_spec(endpoint_id, working_dir)
         globus.transfer(local, f'{dest.host}:{dest.path}', label='crypt4gh pack')
     else:
         raise ValueError(f'Unsupported destination kind: {dest.kind}')
@@ -127,7 +190,8 @@ def pull(source, working_dir):
         _rsync(f'{_hostspec(source)}:{source.path}/', dst)
     elif source.kind == 'globus':
         from . import globus
-        local = _globus_endpoint_spec(working_dir)
+        endpoint_id = ensure_endpoint(working_dir)
+        local = _globus_local_spec(endpoint_id, working_dir)
         globus.transfer(f'{source.host}:{source.path}', local, label='crypt4gh unpack')
     else:
         raise ValueError(f'Unsupported source kind: {source.kind}')

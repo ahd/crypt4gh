@@ -72,6 +72,107 @@ DEFAULT_CONFIG_DIR = DEFAULT_SHARE_DIR / 'config'
 
 _DOWNLOAD_CHUNK = 1 << 20  # 1 MiB
 
+
+def _state_path():
+    """Path of the per-user endpoint state file (XDG_CONFIG_HOME aware)."""
+    base = os.environ.get('XDG_CONFIG_HOME') or (Path.home() / '.config')
+    return Path(base) / 'crypt4gh' / 'globus.json'
+
+
+def save_endpoint_state(endpoint_id, config_dir, *, restrict_paths=None, path=None):
+    """Record ``{endpoint_id, config_dir, restrict_paths}`` so the transport can
+    rediscover an isolated ``-dir`` endpoint that ``globus endpoint local-id``
+    cannot see, and know which paths it currently shares.
+
+    ``restrict_paths`` is the list of ``-restrict-paths`` rules the endpoint was
+    last (re)started with -- the only record of an isolated endpoint's shared
+    paths, which GCP keeps nowhere on disk.
+
+    Best-effort: a write failure is logged, not raised -- a missing state file
+    only costs us the auto-discovery convenience (the env override and the CLI
+    remain).  Written atomically via a temp file + rename.
+    """
+    path = Path(path) if path else _state_path()
+    data = {'endpoint_id': str(endpoint_id)}
+    if config_dir is not None:
+        data['config_dir'] = str(config_dir)
+    if restrict_paths is not None:
+        data['restrict_paths'] = list(restrict_paths)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + '.tmp')
+        tmp.write_text(json.dumps(data, indent=2) + '\n')
+        tmp.replace(path)
+        LOG.info('Recorded local Globus endpoint in %s', path)
+    except OSError as exc:
+        LOG.warning('could not write endpoint state %s: %s', path, exc)
+
+
+def load_endpoint_state(*, path=None):
+    """Return the ``{endpoint_id, config_dir}`` dict, or ``None`` if unreadable.
+
+    ``config_dir`` may be absent (a non-isolated endpoint).  Any IO or parse
+    error -- including the file simply not existing -- yields ``None``.
+    """
+    path = Path(path) if path else _state_path()
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or not data.get('endpoint_id'):
+        return None
+    return data
+
+
+#: The rule that keeps the user's home reachable; GCP's own default, which we
+#: always preserve when we augment ``-restrict-paths`` with a working dir.
+HOME_RULE = 'rw~/'
+
+
+def restrict_rule_path(rule):
+    """Split a ``-restrict-paths`` rule into ``(access, absolute_path)``.
+
+    A rule is an optional access prefix (any of ``r``/``w``/``n``, case
+    insensitive) followed by a path that may start with ``~``; no prefix means
+    ``rw`` (GCP's default).  The path is ``~``-expanded and canonicalised so it
+    can be prefix-matched against a real filesystem path.
+    """
+    i = 0
+    while i < len(rule) and rule[i] in 'rwnRWN':
+        i += 1
+    access = rule[:i].lower() or 'rw'
+    path = os.path.realpath(os.path.expanduser(rule[i:]))
+    return access, path
+
+
+def restrict_path_covered(path, rules):
+    """True if ``path`` is granted (r or w) access by ``rules``.
+
+    Uses longest-prefix-wins (matching GCP's own rule precedence), so a broad
+    grant can be overridden by a more specific ``n`` (no access) rule.
+    """
+    target = os.path.realpath(path)
+    best_len, best_access = -1, None
+    for rule in rules:
+        access, base = restrict_rule_path(rule)
+        if target == base or target.startswith(base.rstrip(os.sep) + os.sep):
+            if len(base) > best_len:
+                best_len, best_access = len(base), access
+    return best_access is not None and ('r' in best_access or 'w' in best_access)
+
+
+def current_restrict_paths(*, state_path=None):
+    """The endpoint's currently-shared rules, from the state file.
+
+    Falls back to ``[HOME_RULE]`` (GCP's default) when we have not recorded a
+    restart -- i.e. the endpoint is running with whatever it was last started
+    with, which for a fresh :func:`ensure_usable` is home only.
+    """
+    state = load_endpoint_state(path=state_path)
+    if state and state.get('restrict_paths'):
+        return list(state['restrict_paths'])
+    return [HOME_RULE]
+
 #: How long to wait for a freshly started endpoint to report "connected".
 _START_TIMEOUT = 60
 _START_POLL = 3
@@ -254,8 +355,13 @@ def setup(launcher, setup_key, *, config_dir=None):
     LOG.info('Endpoint registered%s', f' in {config_dir}' if config_dir else '')
 
 
-def start(launcher, *, config_dir=None, timeout=_START_TIMEOUT):
-    """Start the endpoint in the background and wait until it is connected."""
+def start(launcher, *, config_dir=None, restrict_paths=None, timeout=_START_TIMEOUT):
+    """Start the endpoint in the background and wait until it is connected.
+
+    ``restrict_paths`` is a list of rules passed as ``-restrict-paths``; it takes
+    effect only at start time and overrides any GUI-configured paths, so this is
+    how an isolated ``-dir`` endpoint's shared paths are set.
+    """
     if is_connected(launcher, config_dir=config_dir):
         LOG.info('Endpoint already connected')
         return
@@ -263,6 +369,8 @@ def start(launcher, *, config_dir=None, timeout=_START_TIMEOUT):
     log_path.mkdir(parents=True, exist_ok=True)
     logfile = log_path / 'gcp-start.log'
     cmd = [str(launcher), *_dir_args(config_dir), '-start']
+    if restrict_paths:
+        cmd += ['-restrict-paths', ','.join(restrict_paths)]
     LOG.info('Starting endpoint: %s (log: %s)', ' '.join(cmd), logfile)
     try:
         with open(logfile, 'ab') as lf:
@@ -284,6 +392,36 @@ def start(launcher, *, config_dir=None, timeout=_START_TIMEOUT):
 def stop(launcher, *, config_dir=None):
     """Stop a running endpoint (no error if it was not running)."""
     _capture(launcher, '-stop', config_dir=config_dir)
+
+
+def restart(launcher, *, config_dir=None, restrict_paths=None, timeout=_START_TIMEOUT):
+    """Stop then start the endpoint, applying ``restrict_paths``, and wait until
+    it is reconnected.
+
+    Restarting is the only way to change an endpoint's accessible paths: GCP
+    reads ``-restrict-paths`` at start time (verified by the ih8.2 spike).
+    """
+    stop(launcher, config_dir=config_dir)
+    start(launcher, config_dir=config_dir, restrict_paths=restrict_paths, timeout=timeout)
+
+
+def ensure_path_shared(launcher, endpoint_id, config_dir, path, *, state_path=None):
+    """Ensure ``path`` is reachable by the endpoint, restarting once if not.
+
+    Idempotent: a no-op (returns ``False``) when ``path`` is already covered by
+    the recorded rules.  Otherwise appends ``rw<realpath>`` to the current rules,
+    restarts the endpoint with the augmented set, records it in the state file,
+    and returns ``True``.
+    """
+    rules = current_restrict_paths(state_path=state_path)
+    if restrict_path_covered(path, rules):
+        LOG.info('%s is already shared by the local Globus endpoint', path)
+        return False
+    new_rules = rules + ['rw' + os.path.realpath(path)]
+    LOG.info('Sharing %s with the local Globus endpoint (restart)', path)
+    restart(launcher, config_dir=config_dir, restrict_paths=new_rules)
+    save_endpoint_state(endpoint_id, config_dir, restrict_paths=new_rules, path=state_path)
+    return True
 
 
 def create_setup_key(name):
@@ -343,6 +481,12 @@ def ensure_usable(*, name=None, setup_key=None, config_dir=DEFAULT_CONFIG_DIR,
         setup(launcher, setup_key, config_dir=config_dir)
 
     start(launcher, config_dir=config_dir)
+    if ep_id:
+        # Only a fresh auto-create yields the id here; persist it (with the
+        # config dir) so the transport can find this endpoint without the
+        # C4GH_GLOBUS_LOCAL_ENDPOINT export -- `globus endpoint local-id`
+        # cannot see an isolated ``-dir`` endpoint.
+        save_endpoint_state(ep_id, config_dir)
     return launcher, ep_id
 
 

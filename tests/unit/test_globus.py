@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
+import os
 import subprocess
 
 import pytest
 
-from crypt4gh.pack import transport, globus
+from crypt4gh.pack import transport, globus, gcp_install
 
 
 # ----------------------------------------------------------------------
@@ -62,6 +63,8 @@ def cli(monkeypatch):
 
     monkeypatch.setattr(globus.subprocess, 'run', fake_run)
     monkeypatch.delenv(globus.LOCAL_ENDPOINT_ENV, raising=False)
+    # No state file unless a test provides one, so the resolver reaches the CLI.
+    monkeypatch.setattr(gcp_install, 'load_endpoint_state', lambda **kw: None)
     return calls
 
 
@@ -80,6 +83,38 @@ def test_local_endpoint_id_env_override(cli, monkeypatch):
     monkeypatch.setenv(globus.LOCAL_ENDPOINT_ENV, 'OVERRIDE-EP')
     assert globus.local_endpoint_id() == 'OVERRIDE-EP'
     assert cli == []  # override short-circuits the CLI
+
+
+def test_resolve_local_endpoint_from_cli(cli):
+    assert globus.resolve_local_endpoint() == ('LOCAL-EP', None)
+    assert cli[0][1:] == ['endpoint', 'local-id']
+
+
+def test_resolve_local_endpoint_env_override(cli, monkeypatch):
+    monkeypatch.setenv(globus.LOCAL_ENDPOINT_ENV, 'OVERRIDE-EP')
+    assert globus.resolve_local_endpoint() == ('OVERRIDE-EP', None)
+    assert cli == []  # env short-circuits both the state file and the CLI
+
+
+def test_resolve_local_endpoint_from_state(cli, monkeypatch):
+    # State file wins over the CLI and carries the isolated endpoint's config dir.
+    monkeypatch.setattr(gcp_install, 'load_endpoint_state',
+                        lambda **kw: {'endpoint_id': 'STATE-EP',
+                                      'config_dir': '/cfg/dir'})
+    assert globus.resolve_local_endpoint() == ('STATE-EP', '/cfg/dir')
+    assert cli == []  # never falls through to `endpoint local-id`
+
+
+def test_resolve_local_endpoint_state_without_config_dir(cli, monkeypatch):
+    monkeypatch.setattr(gcp_install, 'load_endpoint_state',
+                        lambda **kw: {'endpoint_id': 'STATE-EP'})
+    assert globus.resolve_local_endpoint() == ('STATE-EP', None)
+
+
+def test_local_endpoint_id_delegates(cli, monkeypatch):
+    monkeypatch.setattr(gcp_install, 'load_endpoint_state',
+                        lambda **kw: {'endpoint_id': 'STATE-EP', 'config_dir': '/c'})
+    assert globus.local_endpoint_id() == 'STATE-EP'  # id only, drops config dir
 
 
 def test_submit_transfer_builds_argv(cli):
@@ -110,6 +145,8 @@ def test_transfer_submits_then_waits(cli):
 
 def test_cli_error_is_wrapped(monkeypatch):
     monkeypatch.setattr(globus.shutil, 'which', lambda _n: '/usr/bin/globus')
+    monkeypatch.delenv(globus.LOCAL_ENDPOINT_ENV, raising=False)
+    monkeypatch.setattr(gcp_install, 'load_endpoint_state', lambda **kw: None)
 
     def boom(argv, **kw):
         raise subprocess.CalledProcessError(1, argv, stderr='permission denied')
@@ -120,26 +157,33 @@ def test_cli_error_is_wrapped(monkeypatch):
 
 
 # ----------------------------------------------------------------------
-# config-paths sharing check
+# restrict-paths sharing check
 # ----------------------------------------------------------------------
 def test_working_is_shared_hit(tmp_path):
-    cfg = tmp_path / 'config-paths'
-    cfg.write_text(f'{tmp_path}/,0,1\n/other,0,1\n')
-    ok, reason = globus.working_is_shared(str(tmp_path / 'stage'), config_paths=str(cfg))
+    ok, reason = globus.working_is_shared(str(tmp_path / 'stage'),
+                                          rules=[f'rw{tmp_path}', 'rw/other'])
     assert ok and reason is None
 
 
 def test_working_is_shared_miss(tmp_path):
-    cfg = tmp_path / 'config-paths'
-    cfg.write_text('/somewhere/else,0,1\n')
-    ok, reason = globus.working_is_shared(str(tmp_path / 'stage'), config_paths=str(cfg))
+    ok, reason = globus.working_is_shared(str(tmp_path / 'stage'),
+                                          rules=['rw/somewhere/else'])
     assert not ok
     assert 'not under any path' in reason
 
 
-def test_working_is_shared_unknown_when_no_config(tmp_path):
-    ok, reason = globus.working_is_shared(str(tmp_path), config_paths=str(tmp_path / 'nope'))
+def test_working_is_shared_unknown_when_no_state(monkeypatch, tmp_path):
+    monkeypatch.setattr(gcp_install, 'load_endpoint_state', lambda **kw: None)
+    ok, reason = globus.working_is_shared(str(tmp_path))
     assert ok and reason is None
+
+
+def test_working_is_shared_reads_state(monkeypatch, tmp_path):
+    monkeypatch.setattr(gcp_install, 'load_endpoint_state',
+                        lambda **kw: {'endpoint_id': 'EP',
+                                      'restrict_paths': [f'rw{tmp_path}']})
+    ok, _ = globus.working_is_shared(str(tmp_path / 'stage'))
+    assert ok
 
 
 # ----------------------------------------------------------------------
@@ -147,25 +191,109 @@ def test_working_is_shared_unknown_when_no_config(tmp_path):
 # ----------------------------------------------------------------------
 def test_push_to_globus(monkeypatch, tmp_path):
     calls = {}
-    monkeypatch.setattr(transport, 'LOG', transport.LOG)
-    monkeypatch.setattr(globus, 'local_endpoint_id', lambda: 'LOCAL-EP')
-    monkeypatch.setattr(globus, 'working_is_shared', lambda wd: (True, None))
+    monkeypatch.setattr(transport, 'ensure_endpoint', lambda wd, **k: 'LOCAL-EP')
     monkeypatch.setattr(globus, 'transfer',
                         lambda src, dst, label=None: calls.update(src=src, dst=dst, label=label))
     dest = transport.parse_endpoint('globus:COLL-ID:/incoming/sub')
     transport.push(str(tmp_path), dest)
-    assert calls['src'] == f'LOCAL-EP:{tmp_path}'
+    assert calls['src'] == f'LOCAL-EP:{os.path.realpath(str(tmp_path))}'  # realpath'd
     assert calls['dst'] == 'COLL-ID:/incoming/sub'
 
 
 def test_pull_from_globus(monkeypatch, tmp_path):
     calls = {}
-    monkeypatch.setattr(globus, 'local_endpoint_id', lambda: 'LOCAL-EP')
-    monkeypatch.setattr(globus, 'working_is_shared', lambda wd: (True, None))
+    monkeypatch.setattr(transport, 'ensure_endpoint', lambda wd, **k: 'LOCAL-EP')
     monkeypatch.setattr(globus, 'transfer',
                         lambda src, dst, label=None: calls.update(src=src, dst=dst))
     src = transport.parse_endpoint('globus:COLL-ID:/data')
     work = tmp_path / 'work'
+    work.mkdir()
     transport.pull(src, str(work))
     assert calls['src'] == 'COLL-ID:/data'
-    assert calls['dst'] == f'LOCAL-EP:{work}'
+    assert calls['dst'] == f'LOCAL-EP:{os.path.realpath(str(work))}'
+
+
+# ----------------------------------------------------------------------
+# transport.ensure_endpoint: C -> B -> A orchestration (branch matrix)
+# ----------------------------------------------------------------------
+@pytest.fixture
+def ep(monkeypatch):
+    """Mock the gcp_install/globus surface ensure_endpoint drives; record calls."""
+    rec = {'started': 0, 'shared': 0, 'installed': 0}
+    monkeypatch.setattr(globus, 'resolve_local_endpoint', lambda: ('EP', '/cfg'))
+    monkeypatch.setattr(gcp_install, 'find_on_path', lambda name=None: '/bin/gcp')
+    monkeypatch.setattr(gcp_install, 'current_restrict_paths', lambda **k: ['rw~/'])
+    monkeypatch.setattr(gcp_install, 'ensure_path_shared',
+                        lambda *a, **k: rec.update(shared=rec['shared'] + 1) or False)
+    monkeypatch.setattr(gcp_install, 'start',
+                        lambda *a, **k: rec.update(started=rec['started'] + 1))
+    monkeypatch.setattr(gcp_install, 'ensure_usable',
+                        lambda **k: rec.update(installed=rec['installed'] + 1) or ('/bin/gcp', 'NEW-EP'))
+    monkeypatch.setattr(globus, 'working_is_shared', lambda wd: (True, None))
+    monkeypatch.delenv(transport.GLOBUS_AUTO_INSTALL_ENV, raising=False)
+    return rec
+
+
+def test_ensure_endpoint_already_shared_starts_if_needed(ep):
+    # ensure_path_shared returns False (covered) -> we still call start (a no-op
+    # when connected), and never auto-install.
+    assert transport.ensure_endpoint('/work') == 'EP'
+    assert ep == {'started': 1, 'shared': 1, 'installed': 0}
+
+
+def test_ensure_endpoint_unshared_shares_and_skips_start(monkeypatch, ep):
+    # A restart (ensure_path_shared True) also brings it up, so no separate start.
+    monkeypatch.setattr(gcp_install, 'ensure_path_shared',
+                        lambda *a, **k: ep.update(shared=ep['shared'] + 1) or True)
+    assert transport.ensure_endpoint('/work') == 'EP'
+    assert ep['shared'] == 1 and ep['started'] == 0
+
+
+def test_ensure_endpoint_absent_autoinstall(monkeypatch, ep):
+    monkeypatch.setattr(globus, 'resolve_local_endpoint',
+                        lambda: (_ for _ in ()).throw(globus.GlobusError('none')))
+    # After install, ensure_usable returns the new id directly.
+    assert transport.ensure_endpoint('/work', auto_install=True) == 'NEW-EP'
+    assert ep['installed'] == 1
+
+
+def test_ensure_endpoint_autoinstall_reresolves_when_usable_returns_none(monkeypatch, ep):
+    # ensure_usable returns id=None when it finds a pre-existing connected
+    # endpoint; ensure_endpoint then re-resolves via the (now-written) state file.
+    ids = iter([globus.GlobusError('none'), ('RE-EP', '/cfg')])
+
+    def resolve():
+        val = next(ids)
+        if isinstance(val, Exception):
+            raise val
+        return val
+
+    monkeypatch.setattr(globus, 'resolve_local_endpoint', resolve)
+    monkeypatch.setattr(gcp_install, 'ensure_usable',
+                        lambda **k: ep.update(installed=ep['installed'] + 1) or ('/bin/gcp', None))
+    assert transport.ensure_endpoint('/work', auto_install=True) == 'RE-EP'
+    assert ep['installed'] == 1
+
+
+def test_ensure_endpoint_absent_no_autoinstall_errors(monkeypatch, ep):
+    monkeypatch.setattr(globus, 'resolve_local_endpoint',
+                        lambda: (_ for _ in ()).throw(globus.GlobusError('none')))
+    with pytest.raises(globus.GlobusError, match='no local Globus endpoint'):
+        transport.ensure_endpoint('/work', auto_install=False)
+
+
+def test_ensure_endpoint_autoinstall_from_env(monkeypatch, ep):
+    monkeypatch.setattr(globus, 'resolve_local_endpoint',
+                        lambda: (_ for _ in ()).throw(globus.GlobusError('none')))
+    monkeypatch.setenv(transport.GLOBUS_AUTO_INSTALL_ENV, '1')
+    assert transport.ensure_endpoint('/work') == 'NEW-EP'  # env opts into C
+
+
+def test_ensure_endpoint_no_local_launcher_warns_only(monkeypatch, ep):
+    # A managed collection / DTN: endpoint resolves but nothing to run locally.
+    monkeypatch.setattr(gcp_install, 'find_on_path', lambda name=None: None)
+    warned = []
+    monkeypatch.setattr(globus, 'working_is_shared', lambda wd: (False, 'not shared'))
+    monkeypatch.setattr(transport.LOG, 'warning', lambda *a, **k: warned.append(a))
+    assert transport.ensure_endpoint('/work') == 'EP'
+    assert ep['started'] == 0 and ep['shared'] == 0 and warned

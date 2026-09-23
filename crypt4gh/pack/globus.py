@@ -29,9 +29,6 @@ GLOBUS_BIN = 'globus'
 #: ``globus endpoint local-id`` is ambiguous or unset).
 LOCAL_ENDPOINT_ENV = 'C4GH_GLOBUS_LOCAL_ENDPOINT'
 
-#: Globus Connect Personal records its shared paths here.
-CONFIG_PATHS = os.path.expanduser('~/.globusonline/lta/config-paths')
-
 
 class GlobusError(RuntimeError):
     """A Globus CLI invocation failed (with a human-readable message)."""
@@ -67,20 +64,43 @@ def _json(args):
         raise GlobusError(f'could not parse `globus {" ".join(args)}` output: {e}') from e
 
 
-def local_endpoint_id():
-    """Return the id of this host's local (GCP) Globus endpoint.
+def resolve_local_endpoint():
+    """Resolve this host's local (GCP) endpoint to ``(endpoint_id, config_dir)``.
 
-    Honours the :data:`LOCAL_ENDPOINT_ENV` override, else asks the CLI.
+    Resolution order:
+
+    1. the :data:`LOCAL_ENDPOINT_ENV` override -> ``(id, None)``;
+    2. the state file written by :func:`gcp_install.save_endpoint_state`
+       (``~/.config/crypt4gh/globus.json``) -> ``(id, config_dir)`` -- the only
+       way to find an *isolated* ``-dir`` endpoint, which the CLI below cannot
+       see;
+    3. ``globus endpoint local-id`` -> ``(id, None)``.
+
+    ``config_dir`` is ``None`` for every source but the state file; callers that
+    must ``-stop``/``-start`` the endpoint need that path, so an isolated
+    endpoint has to come from the state file (or the env override plus a known
+    dir) rather than the CLI.
     """
     override = os.getenv(LOCAL_ENDPOINT_ENV)
     if override:
-        return override.strip()
+        return override.strip(), None
+    from . import gcp_install
+    state = gcp_install.load_endpoint_state()
+    if state:
+        return state['endpoint_id'], state.get('config_dir')
     out = _run(['endpoint', 'local-id']).stdout.strip()
     if not out:
         raise GlobusError(
-            'no local Globus endpoint found; start Globus Connect Personal, or '
-            f'set {LOCAL_ENDPOINT_ENV} to the endpoint id')
-    return out
+            'no local Globus endpoint found; start Globus Connect Personal, '
+            f'run `crypt4gh-install-gcp --ensure-usable`, or set '
+            f'{LOCAL_ENDPOINT_ENV} to the endpoint id')
+    return out, None
+
+
+def local_endpoint_id():
+    """Return just the id of this host's local endpoint (see
+    :func:`resolve_local_endpoint`)."""
+    return resolve_local_endpoint()[0]
 
 
 def submit_transfer(src, dst, *, recursive=True, sync_level='checksum', label=None):
@@ -119,40 +139,27 @@ def transfer(src, dst, *, label=None, polling_interval=15, timeout=None):
     return task_id
 
 
-def _shared_paths(config_paths=CONFIG_PATHS):
-    """Parse Globus Connect Personal's ``config-paths`` into absolute prefixes.
+def working_is_shared(working_dir, *, rules=None):
+    """Best-effort check that ``working_dir`` sits on endpoint-exposed storage.
 
-    Each line is ``<path>,<sharing>,<rw>``; ``<path>`` may be ``~``-relative.
-    Returns ``None`` when the file is absent (i.e. we cannot tell -- likely not
-    a GCP host), so callers can distinguish "not shared" from "unknown".
-    """
-    if not os.path.exists(config_paths):
-        return None
-    prefixes = []
-    with open(config_paths) as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            path = line.split(',', 1)[0]
-            prefixes.append(os.path.abspath(os.path.expanduser(path)))
-    return prefixes
-
-
-def working_is_shared(working_dir, config_paths=CONFIG_PATHS):
-    """Best-effort check that ``working_dir`` sits on GCP-exposed storage.
+    An isolated ``-dir`` endpoint keeps its shared paths in no on-disk file;
+    they are the ``-restrict-paths`` rules it was last started with, which we
+    record in the state file.  ``rules`` overrides that lookup (used in tests
+    and by the transport once it has resolved the endpoint).
 
     :returns: ``(ok, reason)``.  ``ok`` is False only on a *definite* miss; when
-        we cannot tell (no config-paths file) it is True with ``reason=None`` so
-        callers do not cry wolf on non-GCP hosts.
+        we have no recorded rules (not our managed endpoint) it is True with
+        ``reason=None`` so callers do not cry wolf on non-GCP hosts.
     """
-    prefixes = _shared_paths(config_paths)
-    if prefixes is None:
-        return True, None
-    wd = os.path.abspath(working_dir)
-    for base in prefixes:
-        if base == os.sep or wd == base or wd.startswith(base.rstrip(os.sep) + os.sep):
+    from . import gcp_install
+    if rules is None:
+        state = gcp_install.load_endpoint_state()
+        if not state or not state.get('restrict_paths'):
             return True, None
-    return False, (f'{wd} is not under any path shared by the local Globus '
-                   f'endpoint ({", ".join(prefixes) or "none"}); GridFTP cannot '
-                   'reach it. Add it to ~/.globusonline/lta/config-paths.')
+        rules = state['restrict_paths']
+    if gcp_install.restrict_path_covered(working_dir, rules):
+        return True, None
+    return False, (f'{os.path.realpath(working_dir)} is not under any path shared '
+                   f'by the local Globus endpoint ({", ".join(rules) or "none"}); '
+                   'GridFTP cannot reach it. Share it via endpoint '
+                   'auto-management or restart with -restrict-paths.')
