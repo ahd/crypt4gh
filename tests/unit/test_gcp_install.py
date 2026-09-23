@@ -160,13 +160,21 @@ def test_start_times_out(monkeypatch, tmp_path):
 
 def test_create_setup_key_parses_json(monkeypatch):
     monkeypatch.setattr(g.shutil, 'which', lambda _n: '/usr/bin/globus')
+    seen = {}
 
     class _P:
         stdout = '{"id": "EP-UUID", "globus_connect_setup_key": "KEY-XYZ"}'
 
-    monkeypatch.setattr(g.subprocess, 'run', lambda *a, **k: _P())
+    def fake_run(argv, **k):
+        seen['argv'] = argv
+        return _P()
+
+    monkeypatch.setattr(g.subprocess, 'run', fake_run)
     ep_id, key = g.create_setup_key('my-endpoint')
     assert (ep_id, key) == ('EP-UUID', 'KEY-XYZ')
+    # Uses the current CLI surface, not the removed `globus endpoint create`.
+    assert seen['argv'][:4] == ['globus', 'gcp', 'create', 'mapped']
+    assert 'my-endpoint' in seen['argv']
 
 
 def test_create_setup_key_needs_cli(monkeypatch):

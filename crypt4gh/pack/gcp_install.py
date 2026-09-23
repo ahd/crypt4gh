@@ -286,18 +286,20 @@ def stop(launcher, *, config_dir=None):
     _capture(launcher, '-stop', config_dir=config_dir)
 
 
-def create_setup_key(name, *, connector='personal'):
-    """Create a Globus endpoint via the ``globus`` CLI and return (id, setup_key).
+def create_setup_key(name):
+    """Create a GCP endpoint via the ``globus`` CLI and return (id, setup_key).
 
-    Requires an authenticated ``globus`` CLI (``globus login``).  Kept isolated
-    so the exact CLI surface is easy to adjust per Globus CLI version.
+    Uses ``globus gcp create mapped`` (the successor to the removed
+    ``globus endpoint create --personal``).  Requires an authenticated ``globus``
+    CLI (``globus login``).  Kept isolated so the exact CLI surface is easy to
+    adjust per Globus CLI version.
     """
     if shutil.which('globus') is None:
         raise InstallError(
             'the `globus` CLI is needed to auto-create a setup key; either run '
             '`globus login`, or pass --setup-key from '
             'https://app.globus.org/collections?add')
-    argv = ['globus', 'endpoint', 'create', '--personal', name, '-F', 'json']
+    argv = ['globus', 'gcp', 'create', 'mapped', name, '-F', 'json']
     try:
         out = subprocess.run(argv, check=True, text=True,
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout
