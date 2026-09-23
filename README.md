@@ -157,6 +157,11 @@ file above):
 crypt4gh-install-gcp --ensure-usable
 ```
 
+Re-running it against an endpoint that is already registered or running is
+safe. It starts nothing new, and it records that endpoint in the state file:
+the id is read from `<config-dir>/lta/client-id.txt`. This is how you adopt an
+endpoint that was set up by hand.
+
 Globus Connect Personal is closed-source vendor software (~100 MB), so it is not
 bundled here. To install only the binary:
 

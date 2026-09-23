@@ -474,38 +474,70 @@ def create_setup_key(name):
     return ep_id, key
 
 
+def _client_id_file(config_dir):
+    return Path(config_dir) / 'lta' / 'client-id.txt'
+
+
+def endpoint_id_from_config(config_dir):
+    """The endpoint id a registered ``-dir`` config records, or ``None``.
+
+    GCP writes the endpoint's UUID to ``<config_dir>/lta/client-id.txt`` at
+    registration (verified live on GCP 3.2.8), so an endpoint set up before the
+    state file existed can still be identified from its config dir alone.
+    """
+    if not config_dir:
+        return None
+    try:
+        return _client_id_file(config_dir).read_text().strip() or None
+    except OSError:
+        return None
+
+
+def _record_endpoint(endpoint_id, config_dir, *, path=None):
+    """Persist ``endpoint_id``/``config_dir`` to the state file, keeping the
+    recorded ``restrict_paths`` when the file already describes this endpoint
+    (re-running the installer must not forget what the transport has shared)."""
+    state = load_endpoint_state(path=path)
+    keep = None
+    if state and state['endpoint_id'] == str(endpoint_id):
+        keep = state.get('restrict_paths')
+    save_endpoint_state(endpoint_id, config_dir, restrict_paths=keep, path=path)
+
+
 def ensure_usable(*, name=None, setup_key=None, config_dir=DEFAULT_CONFIG_DIR,
                   url=DEFAULT_URL, share_dir=DEFAULT_SHARE_DIR, bin_dir=DEFAULT_BIN_DIR,
                   expected_sha256=None, force_install=False):
     """Install (if missing), register and start a *usable* GCP endpoint.
 
     Returns ``(launcher_path, endpoint_id_or_None)``.  If a connected endpoint
-    already exists for ``config_dir`` this is a no-op.  A fresh registration
+    already exists for ``config_dir`` nothing is started.  A fresh registration
     uses ``setup_key`` when given, else auto-creates one via the ``globus`` CLI.
+
+    Whenever the endpoint id is known (a fresh auto-create, or read back from
+    ``config_dir``) it is recorded in the state file with the config dir, so the
+    transport can find this endpoint -- ``globus endpoint local-id`` cannot see
+    an isolated ``-dir`` endpoint.  That includes an endpoint that was already
+    registered or running, e.g. one set up before the state file existed.
     """
     launcher = ensure_installed(url=url, share_dir=share_dir, bin_dir=bin_dir,
                                 force=force_install, expected_sha256=expected_sha256)
 
+    ep_id = None
     if is_connected(launcher, config_dir=config_dir):
         LOG.info('A connected Globus Connect Personal endpoint is already running')
-        return launcher, None
+    else:
+        already_setup = bool(config_dir) and _client_id_file(config_dir).exists()
+        if not already_setup:
+            if not setup_key:
+                name = name or f'crypt4gh-{socket.gethostname()}'
+                LOG.info('Auto-creating a Globus endpoint %r via the globus CLI', name)
+                ep_id, setup_key = create_setup_key(name)
+            setup(launcher, setup_key, config_dir=config_dir)
+        start(launcher, config_dir=config_dir)
 
-    ep_id = None
-    already_setup = bool(config_dir) and (Path(config_dir) / 'lta' / 'client-id.txt').exists()
-    if not already_setup:
-        if not setup_key:
-            name = name or f'crypt4gh-{socket.gethostname()}'
-            LOG.info('Auto-creating a Globus endpoint %r via the globus CLI', name)
-            ep_id, setup_key = create_setup_key(name)
-        setup(launcher, setup_key, config_dir=config_dir)
-
-    start(launcher, config_dir=config_dir)
+    ep_id = ep_id or endpoint_id_from_config(config_dir)
     if ep_id:
-        # Only a fresh auto-create yields the id here; persist it (with the
-        # config dir) so the transport can find this endpoint without the
-        # C4GH_GLOBUS_LOCAL_ENDPOINT export -- `globus endpoint local-id`
-        # cannot see an isolated ``-dir`` endpoint.
-        save_endpoint_state(ep_id, config_dir)
+        _record_endpoint(ep_id, config_dir)
     return launcher, ep_id
 
 
@@ -578,8 +610,8 @@ def main(argv=None):
             print('Globus Connect Personal is installed, registered and connected.',
                   file=sys.stderr)
             if ep_id:
-                print(f'  endpoint id: {ep_id}', file=sys.stderr)
-                print(f'  export C4GH_GLOBUS_LOCAL_ENDPOINT={ep_id}', file=sys.stderr)
+                print(f'  endpoint id: {ep_id} (recorded in {_state_path()})',
+                      file=sys.stderr)
             if config_dir:
                 print(f'  config dir : {config_dir} '
                       f'(manage with: {launcher} -dir {config_dir} -status|-stop)',

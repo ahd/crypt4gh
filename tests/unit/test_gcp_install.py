@@ -183,12 +183,77 @@ def test_create_setup_key_needs_cli(monkeypatch):
         g.create_setup_key('x')
 
 
-def test_ensure_usable_noop_when_connected(monkeypatch):
+def test_ensure_usable_noop_when_connected(monkeypatch, tmp_path):
+    monkeypatch.setenv('XDG_CONFIG_HOME', str(tmp_path / 'xdg'))
     monkeypatch.setattr(g, 'ensure_installed', lambda **k: 'gcp')
     monkeypatch.setattr(g, 'is_connected', lambda *a, **k: True)
     monkeypatch.setattr(g, 'setup', lambda *a, **k: pytest.fail('should not set up'))
     launcher, ep_id = g.ensure_usable(config_dir=None)
     assert launcher == 'gcp' and ep_id is None
+    assert g.load_endpoint_state() is None
+
+
+def _registered_config(tmp_path, ep_id='EP-EXISTING'):
+    cfg = tmp_path / 'cfg'
+    (cfg / 'lta').mkdir(parents=True)
+    (cfg / 'lta' / 'client-id.txt').write_text(ep_id + '\n')
+    return cfg
+
+
+def test_endpoint_id_from_config(tmp_path):
+    assert g.endpoint_id_from_config(None) is None
+    assert g.endpoint_id_from_config(tmp_path / 'missing') is None
+    assert g.endpoint_id_from_config(_registered_config(tmp_path)) == 'EP-EXISTING'
+
+
+def test_ensure_usable_records_already_connected_endpoint(monkeypatch, tmp_path):
+    # An endpoint registered + running before the state file existed must still
+    # be adopted into it (found live on hpcapp01, crypt4gh-ih8.9).
+    monkeypatch.setenv('XDG_CONFIG_HOME', str(tmp_path / 'xdg'))
+    monkeypatch.setattr(g, 'ensure_installed', lambda **k: 'gcp')
+    monkeypatch.setattr(g, 'is_connected', lambda *a, **k: True)
+    monkeypatch.setattr(g, 'setup', lambda *a, **k: pytest.fail('should not set up'))
+    monkeypatch.setattr(g, 'start', lambda *a, **k: pytest.fail('should not start'))
+    cfg = _registered_config(tmp_path)
+    launcher, ep_id = g.ensure_usable(config_dir=cfg)
+    assert ep_id == 'EP-EXISTING'
+    assert g.load_endpoint_state() == {'endpoint_id': 'EP-EXISTING', 'config_dir': str(cfg)}
+
+
+def test_ensure_usable_records_registered_but_stopped_endpoint(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setenv('XDG_CONFIG_HOME', str(tmp_path / 'xdg'))
+    monkeypatch.setattr(g, 'ensure_installed', lambda **k: 'gcp')
+    monkeypatch.setattr(g, 'is_connected', lambda *a, **k: False)
+    monkeypatch.setattr(g, 'create_setup_key', lambda name: pytest.fail('should not create'))
+    monkeypatch.setattr(g, 'setup', lambda *a, **k: pytest.fail('should not set up'))
+    monkeypatch.setattr(g, 'start', lambda l, config_dir=None: calls.append('start'))
+    cfg = _registered_config(tmp_path)
+    launcher, ep_id = g.ensure_usable(config_dir=cfg)
+    assert ep_id == 'EP-EXISTING' and calls == ['start']
+    assert g.load_endpoint_state() == {'endpoint_id': 'EP-EXISTING', 'config_dir': str(cfg)}
+
+
+def test_ensure_usable_keeps_recorded_restrict_paths(monkeypatch, tmp_path):
+    monkeypatch.setenv('XDG_CONFIG_HOME', str(tmp_path / 'xdg'))
+    monkeypatch.setattr(g, 'ensure_installed', lambda **k: 'gcp')
+    monkeypatch.setattr(g, 'is_connected', lambda *a, **k: True)
+    cfg = _registered_config(tmp_path)
+    rules = ['rw~/', 'rw/mnt/lustre/staging']
+    g.save_endpoint_state('EP-EXISTING', cfg, restrict_paths=rules)
+    g.ensure_usable(config_dir=cfg)
+    assert g.load_endpoint_state()['restrict_paths'] == rules
+
+
+def test_ensure_usable_replaces_state_for_other_endpoint(monkeypatch, tmp_path):
+    monkeypatch.setenv('XDG_CONFIG_HOME', str(tmp_path / 'xdg'))
+    monkeypatch.setattr(g, 'ensure_installed', lambda **k: 'gcp')
+    monkeypatch.setattr(g, 'is_connected', lambda *a, **k: True)
+    g.save_endpoint_state('EP-OLD', '/elsewhere', restrict_paths=['rw~/', 'rw/old'])
+    cfg = _registered_config(tmp_path)
+    g.ensure_usable(config_dir=cfg)
+    # A different endpoint's shared paths say nothing about this one.
+    assert g.load_endpoint_state() == {'endpoint_id': 'EP-EXISTING', 'config_dir': str(cfg)}
 
 
 def test_ensure_usable_full_flow(monkeypatch, tmp_path):

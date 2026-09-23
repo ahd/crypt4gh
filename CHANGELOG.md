@@ -63,6 +63,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Minimum Python raised to **3.13**.
 
 ### Fixed
+- `crypt4gh-install-gcp --ensure-usable` now records an endpoint that was
+  *already* registered or running in the state file (its id is read from
+  `<config-dir>/lta/client-id.txt`), keeping any shared paths already recorded
+  for it. Previously only a freshly auto-created endpoint was recorded, so a
+  pre-existing isolated endpoint could never be found by the transport.
 - `crypt4gh.header.validate_edit_list` no longer raises `NameError` on the
   between-reads skip check and no longer `IndexError`s on an empty edit list.
   (The function was previously unreachable; it is now correct and unit-tested.)
