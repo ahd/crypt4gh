@@ -40,6 +40,7 @@ import time
 import json
 import stat
 import shutil
+import signal
 import socket
 import hashlib
 import logging
@@ -173,9 +174,16 @@ def current_restrict_paths(*, state_path=None):
         return list(state['restrict_paths'])
     return [HOME_RULE]
 
-#: How long to wait for a freshly started endpoint to report "connected".
-_START_TIMEOUT = 60
+#: How long to wait for a freshly started endpoint to report "connected" (and,
+#: separately, to become reachable through the Globus transfer API).
+_START_TIMEOUT = 90
 _START_POLL = 3
+#: How long ``-stop`` may take to make the running instance actually exit.
+_STOP_TIMEOUT = 30
+_STOP_POLL = 1
+#: How long an endpoint we did *not* start may claim "connected" locally while
+#: the Globus service cannot reach it, before we restart it.
+_RECOVER_GRACE = 20
 
 
 class InstallError(RuntimeError):
@@ -355,6 +363,116 @@ def setup(launcher, setup_key, *, config_dir=None):
     LOG.info('Endpoint registered%s', f' in {config_dir}' if config_dir else '')
 
 
+def _instance_pids(config_dir):
+    """PIDs of running ``globusconnectpersonal -dir <config_dir> -start`` processes.
+
+    The ``-start`` launcher stays in the foreground for the lifetime of the
+    endpoint, so its presence is ground truth for "an instance is running"
+    independent of ``-status`` (which can disagree with the Globus service, and
+    goes quiet before a stopping instance has actually exited).  Linux ``/proc``
+    only (the installer is Linux-only); an unset ``config_dir`` (the launcher's
+    default dir) cannot be told apart from other endpoints, so yields ``[]``.
+    """
+    if not config_dir:
+        return []
+    wanted = {str(config_dir), os.path.realpath(config_dir)}
+    me = os.getpid()
+    pids = []
+    try:
+        entries = os.listdir('/proc')
+    except OSError:
+        return []
+    for entry in entries:
+        if not entry.isdigit() or int(entry) == me:
+            continue
+        try:
+            argv = Path('/proc', entry, 'cmdline').read_bytes().split(b'\0')
+        except OSError:
+            continue
+        args = [a.decode(errors='replace') for a in argv]
+        if '-start' not in args or '-dir' not in args:
+            continue
+        i = args.index('-dir')
+        if i + 1 < len(args) and args[i + 1] in wanted:
+            pids.append(int(entry))
+    return pids
+
+
+def _start_log(config_dir):
+    return Path(config_dir or DEFAULT_SHARE_DIR) / 'gcp-start.log'
+
+
+def _log_tail(logfile, lines=15):
+    """The last ``lines`` of the start log, indented, for an error message."""
+    try:
+        tail = Path(logfile).read_text(errors='replace').splitlines()[-lines:]
+    except OSError:
+        return ''
+    return ''.join(f'\n    {line}' for line in tail)
+
+
+def _launch(launcher, config_dir, restrict_paths):
+    """Spawn ``-start`` detached, output to the start log; return (proc, logfile)."""
+    logfile = _start_log(config_dir)
+    logfile.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [str(launcher), *_dir_args(config_dir), '-start']
+    if restrict_paths:
+        cmd += ['-restrict-paths', ','.join(restrict_paths)]
+    LOG.info('Starting endpoint: %s (log: %s)', ' '.join(cmd), logfile)
+    try:
+        with open(logfile, 'ab') as lf:
+            proc = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT,
+                                    stdin=subprocess.DEVNULL, start_new_session=True)
+    except OSError as exc:
+        raise InstallError(f'could not start endpoint: {exc}') from exc
+    return proc, logfile
+
+
+def _check_alive(proc, logfile):
+    """Raise if the endpoint process we launched has already exited."""
+    if proc is not None and proc.poll() is not None:
+        raise InstallError(
+            f'the Globus Connect Personal process exited (rc={proc.returncode}) '
+            f'instead of staying up; last lines of {logfile}:{_log_tail(logfile)}')
+
+
+def _wait_connected(launcher, config_dir, proc, logfile, timeout):
+    deadline = time.monotonic() + timeout
+    while not is_connected(launcher, config_dir=config_dir):
+        _check_alive(proc, logfile)
+        if time.monotonic() >= deadline:
+            raise InstallError(
+                f'endpoint did not report "connected" within {timeout}s; '
+                f'last lines of {logfile}:{_log_tail(logfile)}')
+        time.sleep(_START_POLL)
+    _check_alive(proc, logfile)
+    LOG.info('Endpoint connected (local status)')
+
+
+def _wait_reachable(verify, proc, logfile, timeout):
+    """Poll ``verify`` until true (-> True) or ``timeout`` (-> False).
+
+    Fails fast if the process we launched dies meanwhile, and logs progress so
+    a long cloud-side lag does not look like a hang.
+    """
+    start_t = time.monotonic()
+    deadline = start_t + timeout
+    next_note = start_t
+    while True:
+        if verify():
+            LOG.info('Endpoint reachable via the Globus transfer API')
+            return True
+        _check_alive(proc, logfile)
+        now = time.monotonic()
+        if now >= deadline:
+            return False
+        if now >= next_note:
+            LOG.info('Waiting for the Globus service to see the endpoint '
+                     '(%.0fs of %ds)...', now - start_t, timeout)
+            next_note = now + 15
+        time.sleep(_START_POLL)
+
+
 def start(launcher, *, config_dir=None, restrict_paths=None, timeout=_START_TIMEOUT,
           verify=None):
     """Start the endpoint in the background and wait until it is usable.
@@ -365,49 +483,86 @@ def start(launcher, *, config_dir=None, restrict_paths=None, timeout=_START_TIME
 
     ``verify`` is an optional zero-arg predicate for *true* reachability (e.g. a
     transfer-API round-trip): local ``-status`` can report ``connected`` while
-    the Globus cloud still 502s for a few seconds, so when given, ``start`` polls
+    the Globus service cannot reach the endpoint, so when given, ``start`` polls
     ``verify`` until it returns true (or ``timeout`` elapses) before returning.
+
+    Local ``-status`` is never trusted on its own:
+
+    * an instance that is running but *not* connected is stopped (and waited
+      out) before a new one is launched, never doubled up on the same dir;
+    * the process we launch is watched, and its death is reported at once with
+      the tail of its log rather than waited out;
+    * an instance that claims ``connected`` but that the Globus service still
+      cannot reach (after a short grace for one we did not start, the full
+      ``timeout`` for one we did) is restarted once before giving up.
     """
+    proc = None
+    logfile = _start_log(config_dir)
     if is_connected(launcher, config_dir=config_dir):
-        LOG.info('Endpoint already connected')
+        LOG.info('Endpoint already connected (local status)')
     else:
-        log_path = Path(config_dir or DEFAULT_SHARE_DIR)
-        log_path.mkdir(parents=True, exist_ok=True)
-        logfile = log_path / 'gcp-start.log'
-        cmd = [str(launcher), *_dir_args(config_dir), '-start']
-        if restrict_paths:
-            cmd += ['-restrict-paths', ','.join(restrict_paths)]
-        LOG.info('Starting endpoint: %s (log: %s)', ' '.join(cmd), logfile)
-        try:
-            with open(logfile, 'ab') as lf:
-                subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT,
-                                 stdin=subprocess.DEVNULL, start_new_session=True)
-        except OSError as exc:
-            raise InstallError(f'could not start endpoint: {exc}') from exc
+        if _instance_pids(config_dir):
+            LOG.warning('A Globus Connect Personal instance for %s is running but '
+                        'not connected; stopping it before starting afresh', config_dir)
+            stop(launcher, config_dir=config_dir)
+        proc, logfile = _launch(launcher, config_dir, restrict_paths)
+        _wait_connected(launcher, config_dir, proc, logfile, timeout)
 
-        deadline = time.monotonic() + timeout
-        while not is_connected(launcher, config_dir=config_dir):
-            if time.monotonic() >= deadline:
-                raise InstallError(
-                    f'endpoint did not report "connected" within {timeout}s; '
-                    f'see {logfile}')
-            time.sleep(_START_POLL)
-        LOG.info('Endpoint connected')
-
-    if verify is not None:
-        deadline = time.monotonic() + timeout
-        while not verify():
-            if time.monotonic() >= deadline:
-                raise InstallError(
-                    'endpoint reported connected but was not reachable via the '
-                    f'Globus transfer API within {timeout}s (GCDisconnected lag)')
-            time.sleep(_START_POLL)
-        LOG.info('Endpoint reachable via the Globus transfer API')
+    if verify is None:
+        return
+    if _wait_reachable(verify, proc, logfile, timeout if proc else _RECOVER_GRACE):
+        return
+    # "Connected" is a lie the Globus service disagrees with: a wedged or
+    # half-stopped instance (ours or not).  One clean restart, then give up.
+    LOG.warning('The local endpoint says it is connected but the Globus service '
+                'cannot reach it; restarting it')
+    stop(launcher, config_dir=config_dir)
+    proc, logfile = _launch(launcher, config_dir, restrict_paths)
+    _wait_connected(launcher, config_dir, proc, logfile, timeout)
+    if _wait_reachable(verify, proc, logfile, timeout):
+        return
+    raise InstallError(
+        'endpoint reported connected but was not reachable via the Globus '
+        f'transfer API within {timeout}s (GCDisconnected); last lines of '
+        f'{logfile}:{_log_tail(logfile)}')
 
 
-def stop(launcher, *, config_dir=None):
-    """Stop a running endpoint (no error if it was not running)."""
+def stop(launcher, *, config_dir=None, timeout=_STOP_TIMEOUT):
+    """Stop a running endpoint and wait until it has really gone.
+
+    ``-stop`` only *asks* the instance to shut down and returns at once; it can
+    take a while longer to exit, and starting a new instance on the same config
+    dir meanwhile leaves the new one invisible to the Globus service (seen live,
+    crypt4gh-ih8.10).  So wait for its ``-start`` process to exit, escalating to
+    SIGTERM if it outlives ``timeout``.  No error if nothing was running.
+    """
     _capture(launcher, '-stop', config_dir=config_dir)
+    deadline = time.monotonic() + timeout
+    while True:
+        pids = _instance_pids(config_dir)
+        if not pids and not is_connected(launcher, config_dir=config_dir):
+            LOG.info('Endpoint stopped')
+            return
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(_STOP_POLL)
+    if not pids:
+        LOG.warning('Endpoint still reports connected %ds after -stop; carrying on', timeout)
+        return
+    LOG.warning('Endpoint process(es) %s did not exit %ds after -stop; sending SIGTERM',
+                pids, timeout)
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    deadline = time.monotonic() + timeout
+    while _instance_pids(config_dir):
+        if time.monotonic() >= deadline:
+            raise InstallError(f'endpoint process(es) {pids} would not exit; stop them '
+                               f'by hand ({launcher} {" ".join(_dir_args(config_dir))} -stop)')
+        time.sleep(_STOP_POLL)
+    LOG.info('Endpoint stopped')
 
 
 def restart(launcher, *, config_dir=None, restrict_paths=None, timeout=_START_TIMEOUT,

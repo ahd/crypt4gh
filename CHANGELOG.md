@@ -63,6 +63,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Minimum Python raised to **3.13**.
 
 ### Fixed
+- A `globus:` leg no longer hangs on a Globus Connect Personal endpoint that the
+  Globus service cannot see (HTTP 502 `GCDisconnected`), even though its local
+  `-status` says "connected". Seen live when the endpoint was restarted to share
+  a new working directory:
+  - Restarting now waits for the old instance to actually exit, because `-stop`
+    returns before it has gone. If it doesn't exit, it gets SIGTERM. A second
+    instance is never started on the same config dir.
+  - The endpoint process crypt4gh launches is watched. If it dies, crypt4gh
+    stops at once and shows the tail of `gcp-start.log`.
+  - If the endpoint says it is connected but the Globus service still can't
+    reach it, crypt4gh restarts it once. After that it gives up with a clear
+    error, and logs progress while it waits.
+  - Globus CLI error output is captured, not printed to the terminal. Globus
+    and endpoint errors, and Ctrl-C, now end `pack`/`unpack` with a one-line
+    message instead of a traceback.
+- A Globus transfer that ends FAILED is now reported as an error.
+  `globus task wait` returns once a task finishes, whether or not it succeeded,
+  so the final status is now checked.
 - `crypt4gh-install-gcp --ensure-usable` now records an endpoint that was
   *already* registered or running in the state file (its id is read from
   `<config-dir>/lta/client-id.txt`), keeping any shared paths already recorded

@@ -59,6 +59,8 @@ def cli(monkeypatch):
             return _Fake(stdout='LOCAL-EP\n')
         if argv[1] == 'transfer':
             return _Fake(stdout='{"task_id": "TASK-1"}')
+        if argv[1:3] == ['task', 'show']:
+            return _Fake(stdout='{"status": "SUCCEEDED"}')
         return _Fake(stdout='')
 
     monkeypatch.setattr(globus.subprocess, 'run', fake_run)
@@ -154,8 +156,35 @@ def test_wait_builds_argv(cli):
 
 def test_transfer_submits_then_waits(cli):
     globus.transfer('SRC:/a', 'DST:/b')
-    verbs = [c[1] for c in cli]
-    assert verbs == ['transfer', 'task']  # submit, then wait
+    calls = [c[1:4] for c in cli]
+    # submit, wait, then confirm the terminal status
+    assert calls == [['transfer', 'SRC:/a', 'DST:/b'],
+                     ['task', 'wait', 'TASK-1'], ['task', 'show', 'TASK-1']]
+
+
+def test_wait_raises_on_failed_task(monkeypatch):
+    # `globus task wait` exits 0 for any terminal state, FAILED included.
+    monkeypatch.setattr(globus.shutil, 'which', lambda _n: '/usr/bin/globus')
+
+    def fake_run(argv, **kw):
+        if argv[1:3] == ['task', 'show']:
+            return _Fake(stdout='{"status": "FAILED", "nice_status": "PERMISSION_DENIED"}')
+        return _Fake(stdout='')
+
+    monkeypatch.setattr(globus.subprocess, 'run', fake_run)
+    with pytest.raises(globus.GlobusError, match='TASK-2 ended FAILED: PERMISSION_DENIED'):
+        globus.wait('TASK-2')
+
+
+def test_run_captures_stderr(monkeypatch):
+    # CLI error text must not spray onto the terminal (seen live while polling
+    # a starting endpoint); it belongs in the GlobusError instead.
+    seen = {}
+    monkeypatch.setattr(globus.shutil, 'which', lambda _n: '/usr/bin/globus')
+    monkeypatch.setattr(globus.subprocess, 'run',
+                        lambda argv, **kw: seen.update(kw) or _Fake(stdout=''))
+    globus._run(['ls', 'EP:/'])
+    assert seen['stderr'] is subprocess.PIPE
 
 
 def test_cli_error_is_wrapped(monkeypatch):
@@ -364,3 +393,23 @@ def test_ensure_endpoint_no_local_launcher_warns_only(monkeypatch, ep):
     monkeypatch.setattr(transport.LOG, 'warning', lambda *a, **k: warned.append(a))
     assert transport.ensure_endpoint('/work') == 'EP'
     assert ep['started'] == 0 and ep['shared'] == 0 and warned
+
+
+@pytest.mark.parametrize('exc, rc, text', [
+    (globus.GlobusError('502 GCDisconnected'), 1, 'pack: 502 GCDisconnected'),
+    (gcp_install.InstallError('endpoint gone'), 1, 'pack: endpoint gone'),
+    (KeyboardInterrupt(), 130, 'pack: interrupted'),
+])
+def test_cli_reports_globus_failures_without_traceback(monkeypatch, capsys, tmp_path,
+                                                       exc, rc, text):
+    from crypt4gh.pack import cli, api
+
+    def boom(*a, **k):
+        raise exc
+    monkeypatch.setattr(api, 'pack', boom)
+    monkeypatch.setattr(cli, '_load_seckey', lambda *a, **k: b'k' * 32)
+    monkeypatch.setattr(cli, '_load_pubkey', lambda p: b'p' * 32)
+    with pytest.raises(SystemExit) as e:
+        cli.main(['pack', '--recipient_pk', 'x.pub', str(tmp_path), 'globus:C:/p'])
+    assert e.value.code == rc
+    assert text in capsys.readouterr().err

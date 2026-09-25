@@ -357,7 +357,7 @@ def test_start_passes_restrict_paths(monkeypatch, tmp_path):
     states = iter([False, True])  # top guard: not connected; then: connected
     monkeypatch.setattr(g, 'is_connected', lambda *a, **k: next(states))
     monkeypatch.setattr(g.subprocess, 'Popen',
-                        lambda cmd, **kw: seen.update(cmd=cmd) or object())
+                        lambda cmd, **kw: seen.update(cmd=cmd) or _FakeProc())
     g.start('gcp', config_dir=tmp_path, restrict_paths=['rw~/', 'rw/mnt/x'])
     cmd = seen['cmd']
     assert cmd[cmd.index('-restrict-paths') + 1] == 'rw~/,rw/mnt/x'
@@ -414,12 +414,126 @@ def test_start_verify_waits_then_succeeds(monkeypatch, tmp_path):
     g.start('gcp', config_dir=tmp_path, verify=lambda: next(reach))  # returns cleanly
 
 
-def test_start_verify_times_out(monkeypatch, tmp_path):
-    monkeypatch.setattr(g, 'is_connected', lambda *a, **k: True)
+class _FakeProc:
+    """A launched ``-start`` process: alive until ``returncode`` is set."""
+    def __init__(self, returncode=None):
+        self.returncode = returncode
+
+    def poll(self):
+        return self.returncode
+
+
+def _clock(monkeypatch, step=10.0):
+    """A monotonic clock that advances ``step`` seconds per reading."""
+    t = {'now': 0.0}
+
+    def tick():
+        t['now'] += step
+        return t['now']
+    monkeypatch.setattr(g.time, 'monotonic', tick)
     monkeypatch.setattr(g.time, 'sleep', lambda _s: None)
-    monkeypatch.setattr(g.time, 'monotonic', iter([0.0, 100.0, 200.0]).__next__)
+
+
+def test_start_verify_times_out(monkeypatch, tmp_path):
+    # Our own launched instance never becomes reachable, even after the one
+    # restart -> clear error.
+    launches = []
+    connected = iter([False, True, True])
+    monkeypatch.setattr(g, 'is_connected', lambda *a, **k: next(connected))
+    monkeypatch.setattr(g, '_instance_pids', lambda cfg: [])
+    monkeypatch.setattr(g, 'stop', lambda l, config_dir=None: launches.append('stop'))
+    monkeypatch.setattr(g, '_launch', lambda *a: launches.append('launch') or
+                        (_FakeProc(), tmp_path / 'gcp-start.log'))
+    _clock(monkeypatch)
     with pytest.raises(g.InstallError, match='not reachable via the Globus transfer API'):
-        g.start('gcp', config_dir=tmp_path, timeout=1, verify=lambda: False)
+        g.start('gcp', config_dir=tmp_path, timeout=30, verify=lambda: False)
+    assert launches == ['launch', 'stop', 'launch']
+
+
+def test_start_recovers_wedged_preexisting_instance(monkeypatch, tmp_path):
+    # Live failure (ih8.10): local -status says connected, the Globus service
+    # says GCDisconnected.  An instance we did not start gets one clean restart.
+    calls = []
+    reachable = {'up': False}             # the service can only see a relaunched one
+
+    def launch(launcher, cfg, restrict_paths):
+        calls.append(('launch', restrict_paths))
+        reachable['up'] = True
+        return _FakeProc(), tmp_path / 'gcp-start.log'
+
+    monkeypatch.setattr(g, 'is_connected', lambda *a, **k: True)
+    monkeypatch.setattr(g, 'stop', lambda l, config_dir=None: calls.append('stop'))
+    monkeypatch.setattr(g, '_launch', launch)
+    _clock(monkeypatch)
+    g.start('gcp', config_dir=tmp_path, restrict_paths=['rw~/'],
+            verify=lambda: reachable['up'])
+    assert calls == ['stop', ('launch', ['rw~/'])]
+
+
+def test_start_fails_fast_when_launched_process_dies(monkeypatch, tmp_path):
+    log = tmp_path / 'gcp-start.log'
+    log.write_text('Another Globus Connect Personal is currently running\n')
+    monkeypatch.setattr(g, 'is_connected', lambda *a, **k: False)
+    monkeypatch.setattr(g, '_instance_pids', lambda cfg: [])
+    monkeypatch.setattr(g, '_launch', lambda *a: (_FakeProc(returncode=1), log))
+    _clock(monkeypatch, step=0.0)         # the deadline never arrives
+    with pytest.raises(g.InstallError, match=r'exited \(rc=1\)[\s\S]*currently running'):
+        g.start('gcp', config_dir=tmp_path)
+
+
+def test_start_stops_running_but_disconnected_instance_first(monkeypatch, tmp_path):
+    order = []
+    connected = iter([False, True])
+    monkeypatch.setattr(g, 'is_connected', lambda *a, **k: next(connected))
+    monkeypatch.setattr(g, '_instance_pids', lambda cfg: [4242])
+    monkeypatch.setattr(g, 'stop', lambda l, config_dir=None: order.append('stop'))
+    monkeypatch.setattr(g, '_launch',
+                        lambda *a: order.append('launch') or (_FakeProc(), tmp_path / 'l'))
+    _clock(monkeypatch)
+    g.start('gcp', config_dir=tmp_path)
+    assert order == ['stop', 'launch']      # never two instances on one config dir
+
+
+def test_stop_waits_for_process_exit(monkeypatch, tmp_path):
+    # -stop returns at once; the instance exits a few polls later.
+    monkeypatch.setattr(g, '_capture', lambda *a, **k: (0, ''))
+    monkeypatch.setattr(g, 'is_connected', lambda *a, **k: False)
+    pids = iter([[4242], [4242], []])
+    monkeypatch.setattr(g, '_instance_pids', lambda cfg: next(pids))
+    monkeypatch.setattr(g.os, 'kill', lambda *a: pytest.fail('must not signal'))
+    _clock(monkeypatch, step=1.0)
+    g.stop('gcp', config_dir=tmp_path)
+    with pytest.raises(StopIteration):     # polled until the pid was gone
+        next(pids)
+
+
+def test_stop_escalates_to_sigterm(monkeypatch, tmp_path):
+    killed = []
+    monkeypatch.setattr(g, '_capture', lambda *a, **k: (0, ''))
+    monkeypatch.setattr(g, 'is_connected', lambda *a, **k: False)
+    monkeypatch.setattr(g, '_instance_pids', lambda cfg: [] if killed else [4242])
+    monkeypatch.setattr(g.os, 'kill', lambda pid, sig: killed.append((pid, sig)))
+    _clock(monkeypatch)
+    g.stop('gcp', config_dir=tmp_path, timeout=5)
+    assert killed == [(4242, g.signal.SIGTERM)]
+
+
+def test_instance_pids_finds_start_process_for_config_dir(tmp_path):
+    import subprocess
+    import sys
+    cfg = tmp_path / 'cfg'
+    other = tmp_path / 'other'
+    sleeper = 'import time; time.sleep(30)'
+    mine = subprocess.Popen([sys.executable, '-c', sleeper, '-dir', str(cfg), '-start'])
+    theirs = subprocess.Popen([sys.executable, '-c', sleeper, '-dir', str(other), '-start'])
+    status = subprocess.Popen([sys.executable, '-c', sleeper, '-dir', str(cfg), '-status'])
+    try:
+        assert g._instance_pids(cfg) == [mine.pid]
+    finally:
+        for p in (mine, theirs, status):
+            p.kill()
+            p.wait()
+    assert g._instance_pids(None) == []
 
 
 def test_restart_passes_verify(monkeypatch):

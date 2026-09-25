@@ -43,10 +43,16 @@ def ensure_cli():
 
 
 def _run(args, **kw):
-    """Run ``globus <args>``; raise :class:`GlobusError` on failure."""
+    """Run ``globus <args>``; raise :class:`GlobusError` on failure.
+
+    stderr is captured (not passed through to the terminal) so an expected
+    failure -- e.g. a reachability probe polling a starting endpoint -- stays
+    quiet; its text is carried in the :class:`GlobusError` message instead.
+    """
     ensure_cli()
     argv = [GLOBUS_BIN, *args]
     LOG.debug('running: %s', ' '.join(argv))
+    kw.setdefault('stderr', subprocess.PIPE)
     try:
         return subprocess.run(argv, check=True, text=True,
                               stdout=subprocess.PIPE, **kw)
@@ -115,7 +121,8 @@ def endpoint_reachable(endpoint_id):
     try:
         _run(['ls', f'{endpoint_id}:/'])
         return True
-    except GlobusError:
+    except GlobusError as e:
+        LOG.debug('endpoint %s not reachable yet: %s', endpoint_id, e)
         return False
 
 
@@ -146,6 +153,15 @@ def wait(task_id, *, polling_interval=15, timeout=None):
         args += ['--timeout', str(timeout)]
     LOG.info('Waiting for Globus task %s', task_id)
     _run(args)
+    # `task wait` returns once the task is *terminal*, failed or not; check.
+    doc = _json(['task', 'show', task_id])
+    status = doc.get('status')
+    if status != 'SUCCEEDED':
+        raise GlobusError(f'Globus task {task_id} ended {status or "in an unknown state"}: '
+                          f'{doc.get("nice_status_short_description") or doc.get("nice_status") or ""}'
+                          .rstrip(': '))
+    LOG.info('Globus task %s succeeded (%s files, %s bytes)', task_id,
+             doc.get('files_transferred'), doc.get('bytes_transferred'))
 
 
 def transfer(src, dst, *, label=None, polling_interval=15, timeout=None):

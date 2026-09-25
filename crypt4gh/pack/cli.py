@@ -18,6 +18,8 @@ from getpass import getpass
 from .. import __version__, PROG
 from ..keys import get_public_key, get_private_key
 from . import api
+from .gcp_install import InstallError
+from .globus import GlobusError
 
 LOG = logging.getLogger(__name__)
 
@@ -153,7 +155,11 @@ def main(argv):
             summary = api.unpack(args.source, args.dest, seckey=seckey,
                                  sender_pubkey=sender_pk, working_dir=args.working, jobs=args.jobs,
                                  globus_options=globus_options)
-    except (ValueError, OSError, sqlite3.Error, subprocess.SubprocessError) as e:
+    except KeyboardInterrupt:
+        print(f'{verb}: interrupted', file=sys.stderr)
+        sys.exit(130)
+    except (ValueError, OSError, sqlite3.Error, subprocess.SubprocessError,
+            GlobusError, InstallError) as e:
         print(f'{verb}: {e}', file=sys.stderr)
         sys.exit(1)
 
