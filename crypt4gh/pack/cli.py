@@ -17,7 +17,7 @@ from getpass import getpass
 
 from .. import __version__, PROG
 from ..keys import get_public_key, get_private_key
-from . import api
+from . import api, logsetup
 from .gcp_install import InstallError
 from .globus import GlobusError
 
@@ -66,7 +66,13 @@ def _add_common(p):
                         'else $C4GH_WORKDIR or ./crypt4gh-work). The SQLite catalog lives at its root.')
     p.add_argument('--jobs', '-j', type=int, default=0, metavar='N',
                    help='Number of parallel workers (default: min(cpu_count, 8))')
-    p.add_argument('-v', '--verbose', action='count', default=0, help='Increase logging verbosity')
+    p.add_argument('-v', '--verbose', action='count', default=0,
+                   help='More detail on the terminal: -v for progress, -vv for debug')
+    p.add_argument('--log', metavar='FILE', default=os.getenv('C4GH_LOG'),
+                   help='Also log to FILE (default: $C4GH_LOG): a JSON logging.config '
+                        'dictConfig document if FILE is one (as for the streaming verbs), '
+                        'else a file that records are appended to at INFO (DEBUG with -vv), '
+                        'regardless of -v. Covers workers, directory and Globus operations.')
 
     g = p.add_argument_group('globus endpoint (only used for a globus: source/dest)')
     g.add_argument('--globus-endpoint', metavar='ID',
@@ -112,24 +118,13 @@ def _build_parser(verb):
     return p
 
 
-def _configure_logging(verbose):
-    level = logging.CRITICAL
-    if os.getenv('C4GH_DEBUG'):
-        level = logging.DEBUG
-    elif verbose >= 2:
-        level = logging.DEBUG
-    elif verbose == 1:
-        level = logging.INFO
-    logging.basicConfig(stream=sys.stderr, level=level, format='[%(levelname)s] %(message)s')
-
-
 # ----------------------------------------------------------------------
 # entry point
 # ----------------------------------------------------------------------
 def main(argv):
     verb, rest = argv[0], argv[1:]
     args = _build_parser(verb).parse_args(rest)
-    _configure_logging(args.verbose)
+    logsetup.configure(args.verbose, args.log)
 
     # Endpoint-management options for a globus: leg (ignored for local/ssh).
     # --install-gcp forces auto-install; without it, auto_install stays None so
@@ -156,12 +151,16 @@ def main(argv):
                                  sender_pubkey=sender_pk, working_dir=args.working, jobs=args.jobs,
                                  globus_options=globus_options)
     except KeyboardInterrupt:
+        LOG.error('%s: interrupted', verb, extra=logsetup.QUIET)
         print(f'{verb}: interrupted', file=sys.stderr)
         sys.exit(130)
     except (ValueError, OSError, sqlite3.Error, subprocess.SubprocessError,
             GlobusError, InstallError) as e:
+        LOG.error('%s failed: %s', verb, e, extra=logsetup.QUIET)
         print(f'{verb}: {e}', file=sys.stderr)
         sys.exit(1)
 
-    print(f'{verb}: {summary["done"]} item(s) done, {summary["error"]} error(s)', file=sys.stderr)
+    done = f'{verb}: {summary["done"]} item(s) done, {summary["error"]} error(s)'
+    LOG.info('%s', done, extra=logsetup.QUIET)
+    print(done, file=sys.stderr)
     return 0

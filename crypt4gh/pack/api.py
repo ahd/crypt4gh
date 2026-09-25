@@ -15,7 +15,7 @@ import logging
 from concurrent.futures import ProcessPoolExecutor
 
 from .. import __version__
-from . import codecs, transport
+from . import codecs, logsetup, transport
 from .catalog import Catalog
 from .crypto import LocalCryptor
 from .fs import source_fs
@@ -40,7 +40,9 @@ def _run_pool(func, jobs, njobs):
         return []
     if njobs == 1:
         return [func(j) for j in jobs]
-    with ProcessPoolExecutor(max_workers=njobs) as pool:
+    # Workers do not inherit logging under forkserver/spawn; hand it over.
+    with ProcessPoolExecutor(max_workers=njobs, initializer=logsetup.worker_init,
+                             initargs=(logsetup.current(),)) as pool:
         return list(pool.map(func, jobs))
 
 
@@ -94,12 +96,16 @@ def pack(source, dest, *, seckey, recipient_pubkeys, tar=False, compress='none',
         'recipients': [pk.hex() for pk in recipient_pubkeys],
     }
     catalog_path = os.path.join(working, CATALOG_NAME)
+    LOG.info('pack %s -> %s (crypt4gh %s; tar=%s, compress=%s, %d recipient(s))',
+             src, dst, __version__, tar, options['compress'], len(recipient_pubkeys))
 
     # -- enumerate + record (close the DB before forking any workers) ------
     with Catalog(catalog_path) as catalog:
         run_id = catalog.start_run('pack', str(src), str(dst), options, __version__)
         encryptable = []
+        kinds = {}
         for entry in _enumerate_pack(fs, tar, codec_name, codec_level):
+            kinds[entry['kind']] = kinds.get(entry['kind'], 0) + 1
             if entry['kind'] in ('file', 'tar'):
                 entry['cipher_relpath'] = cipher_name(entry['relpath'], entry['kind'],
                                                       entry.get('codec', 'none'))
@@ -108,6 +114,8 @@ def pack(source, dest, *, seckey, recipient_pubkeys, tar=False, compress='none',
             else:
                 entry['status'] = 'done'  # dir / symlink: metadata only
             catalog.add_item(run_id, entry)
+    LOG.info('Walked %s: %s; catalog %s', src,
+             ', '.join(f'{n} {k}' for k, n in sorted(kinds.items())) or 'empty', catalog_path)
 
     # -- transform (no DB connection is held open across the pool) ---------
     cryptor = LocalCryptor(seckey, recipient_pubkeys, sender_pubkey)
@@ -132,6 +140,7 @@ def pack(source, dest, *, seckey, recipient_pubkeys, tar=False, compress='none',
     if dst.is_remote or (dst.kind == 'local' and os.path.abspath(dst.path) != working):
         LOG.info('Pushing staged ciphertext to %s', dst)
         transport.push(working, dst, globus=globus_options)
+        LOG.info('Pushed %s to %s', working, dst)
 
     return summary
 
@@ -165,6 +174,8 @@ def unpack(source, dest, *, seckey, sender_pubkey=None, working_dir=None, jobs=N
         raise ValueError('At most one of source/destination may be remote (like rsync)')
 
     working = os.path.abspath(working_dir) if working_dir else os.path.abspath(DEFAULT_WORKDIR)
+    LOG.info('unpack %s -> %s (crypt4gh %s; sender check %s)', src, dst, __version__,
+             'on' if sender_pubkey else 'off')
 
     # Locate the ciphertext (pull it local if the source is remote).
     if src.kind == 'local':
@@ -174,6 +185,7 @@ def unpack(source, dest, *, seckey, sender_pubkey=None, working_dir=None, jobs=N
         cipher_dir = os.path.join(working, 'ciphertext')
         LOG.info('Pulling ciphertext from %s', src)
         transport.pull(src, cipher_dir, globus=globus_options)
+        LOG.info('Pulled %s into %s', src, cipher_dir)
 
     # Output straight into a local dest; otherwise stage then push.
     if dst.kind == 'local':
@@ -187,6 +199,8 @@ def unpack(source, dest, *, seckey, sender_pubkey=None, working_dir=None, jobs=N
 
     # Create empty dirs and symlinks first (shallow -> deep).
     _prepare_tree(out_root, items)
+    LOG.info('Prepared %s: %d dir(s), %d symlink(s)', out_root,
+             sum(i['kind'] == 'dir' for i in items), sum(i['kind'] == 'symlink' for i in items))
 
     encryptable = [it for it in items if it['kind'] in ('file', 'tar')]
     cryptor = LocalCryptor(seckey, (), sender_pubkey)
@@ -209,6 +223,7 @@ def unpack(source, dest, *, seckey, sender_pubkey=None, working_dir=None, jobs=N
     if dst.is_remote:
         LOG.info('Pushing plaintext to %s', dst)
         transport.push(out_root, dst, globus=globus_options)
+        LOG.info('Pushed %s to %s', out_root, dst)
 
     return summary
 

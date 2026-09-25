@@ -119,6 +119,8 @@ def pack_item(job):
             cipher_size=writer.count,
             cipher_sha256=writer.hexdigest(),
         )
+        LOG.debug('Packed %s -> %s (%d -> %d bytes)', relpath, cipher_path,
+                  reader.count, writer.count)
     except Exception as e:  # keep one bad item from killing the whole run
         LOG.error('Failed to pack %s: %s', relpath, e)
         _kill(procs)
@@ -175,6 +177,8 @@ def unpack_item(job):
             raise ValueError(f'Integrity check failed for {relpath}: SHA-256 mismatch')
 
         result.update(status='done', plain_sha256=writer.hexdigest(), plain_size=writer.count)
+        LOG.debug('Unpacked %s (%s, %d bytes, SHA-256 %s)', relpath, kind, writer.count,
+                  'verified' if expected else 'not recorded')
     except Exception as e:
         LOG.error('Failed to unpack %s: %s', relpath, e)
         _kill(procs)

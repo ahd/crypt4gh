@@ -62,6 +62,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`uv sync`, `uv run pytest`, `uv build`).
 - Minimum Python raised to **3.13**.
 
+### Added (logging)
+- `pack`/`unpack` accept `--log FILE`, defaulting to `$C4GH_LOG`:
+  - If FILE is a JSON `logging.config` document, it is applied, exactly as for
+    the streaming verbs.
+  - Otherwise log records are appended to FILE, with timestamps and process
+    names. The file gets INFO whatever `-v` says, or DEBUG with `-vv`.
+  - The log covers the whole run: pool workers (which on Python 3.14 start
+    without the parent's logging setup, so it is now passed to them), the
+    directory walk and tree preparation, each item at DEBUG, Globus endpoint
+    management and transfers (task ids and outcomes), and the final result or
+    error.
+
 ### Fixed
 - A `globus:` leg no longer hangs on a Globus Connect Personal endpoint that the
   Globus service cannot see (HTTP 502 `GCDisconnected`), even though its local
