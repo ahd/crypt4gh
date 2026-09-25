@@ -30,6 +30,10 @@ $ crypt4gh -h
 
 Utility for the cryptographic GA4GH standard, reading from stdin and outputting to stdout.
 
+Whole directory trees (local, ssh or Globus; parallel, with a catalog):
+   crypt4gh pack [options] <source> <dest>      see: crypt4gh pack --help
+   crypt4gh unpack [options] <source> <dest>    see: crypt4gh unpack --help
+
 Usage:
    {PROG} [-hv] [--log <file>] encrypt [--sk <path>] --recipient_pk <path> [--recipient_pk <path>]... [--range <start-end>]  [--header <path>]
    {PROG} [-hv] [--log <file>] decrypt [--sk <path>] [--sender_pk <path>] [--range <start-end>]
@@ -39,7 +43,7 @@ Usage:
 Options:
    -h, --help             Prints this help and exit
    -v, --version          Prints the version and exits
-   --log <file>           Path to the logger file (in YML format)
+   --log <file>           Path to a logging configuration file (JSON, logging.config.dictConfig)
    --sk <keyfile>         Curve25519-based Private key.
                           When encrypting, if neither the private key nor C4GH_SECRET_KEY are specified, we generate a new key 
    --recipient_pk <path>  Recipient's Curve25519-based Public key
@@ -53,6 +57,11 @@ Options:
 Environment variables:
    C4GH_LOG         If defined, it will be used as the default logger
    C4GH_SECRET_KEY  If defined, it will be used as the default secret key (ie --sk ${C4GH_SECRET_KEY})
+   C4GH_PASSPHRASE  If defined, it will be used as the passphrase
+                    for decoding the secret key, replacing the callback.
+                    Note: this is insecure. Only used for testing
+   C4GH_DEBUG       If True, it will print (a lot of) debug information.
+                    (Watch out: the output contains secrets)
  
 ```
 
@@ -93,18 +102,31 @@ $ crypt4gh pack --sk bob.sec --recipient_pk alice.pub ./data ./vault
 $ crypt4gh unpack --sk alice.sec ./vault ./restored
 ```
 
-Options:
+`crypt4gh pack --help` and `crypt4gh unpack --help` describe every option,
+environment variable and endpoint form. In short:
 
+* `--sk` is your secret key: the *sender* for `pack`, the *recipient* for
+  `unpack`. It defaults to `$C4GH_SECRET_KEY`, and the passphrase is prompted
+  for, or taken from `$C4GH_PASSPHRASE`, which is insecure.
+  `--recipient_pk` (for `pack`, repeatable) says who can decrypt.
+  `--sender_pk` (for `unpack`, optional) rejects anything that was not
+  encrypted by that sender.
 * `--tar` bundles each top-level subdirectory into a single tar archive before
   encryption (loose files at the root are still encrypted individually).
 * `--compress none|gzip|bzip2|zstd` compresses tarred subdirectories between
   tarring and encryption, with an optional level (e.g. `--compress zstd:19`).
   The default is `none` (genomic payloads are usually already compressed).
 * Source or destination may be a remote, rsync-style `[user@]host:/path`.
-  Ciphertext is staged in a local working directory (`--working`, default
-  `$C4GH_WORKDIR` or else `./crypt4gh-work`) and moved with rsync over ssh; a remote
-  *source* is streamed over ssh so plaintext is never written to disk in transit.
-* `--jobs N` sets the number of parallel workers.
+  Ciphertext is staged in a local working directory and moved with rsync over
+  ssh. A remote *source* is streamed over ssh, so its plaintext is never
+  written to disk here.
+* `--working DIR` sets the staging directory. For `pack` the default is the
+  destination when it is local. Otherwise, and always for `unpack`, the
+  default is `$C4GH_WORKDIR`, or else `./crypt4gh-work`. It must hold the
+  whole staged set.
+* `--jobs N` sets the number of parallel workers (default `min(cpu_count, 8)`).
+* `-v` and `-vv` add progress and debug output on the terminal. `--log FILE`
+  (default `$C4GH_LOG`) also logs the run to a file (see below).
 
 Each run writes a SQLite catalog (`<working>/catalog.sqlite`) recording every
 item's size, mtime, mode and plaintext/ciphertext SHA-256 — used for integrity
@@ -117,34 +139,77 @@ Either the source or the destination may be a Globus collection, addressed as
 
 ```bash
 # pack a tree and push the ciphertext to a Globus collection
-crypt4gh pack ./data globus:<COLLECTION-ID>:/incoming --recipient-pk bob.pub
+crypt4gh pack --recipient_pk bob.pub ./data globus:<COLLECTION-ID>:/incoming/
 
 # pull ciphertext from a collection and unpack it locally
-crypt4gh unpack globus:<COLLECTION-ID>:/incoming ./out --sk mysecret.key
+crypt4gh unpack --sk mysecret.key globus:<COLLECTION-ID>:/incoming/ ./out
 ```
 
 Globus moves files *at rest* between two endpoints, so the local side of the
 transfer is this host's Globus Connect Personal (GCP) endpoint. crypt4gh manages
-that endpoint for you: before a `globus:` transfer it resolves the local
-endpoint, **starts it if it is not running**, and **shares the working directory**
-(via GCP `-restrict-paths`, restarting once if needed) so GridFTP can reach the
-staged ciphertext. The endpoint is discovered in this order:
+that endpoint for you. Before a `globus:` transfer it:
 
-1. `C4GH_GLOBUS_LOCAL_ENDPOINT=<endpoint-id>` (explicit override);
+- resolves the local endpoint;
+- **shares the working directory** with it, via GCP `-restrict-paths`. This
+  restarts the endpoint, and crypt4gh waits for the old instance to exit
+  first;
+- **starts the endpoint if it is not running**;
+- waits until the Globus service can actually reach the endpoint, not just
+  until its local status says "connected". If it never becomes reachable,
+  crypt4gh restarts it once, then gives up with a clear error.
+
+The transfer itself is recursive with `--sync-level checksum`, and its final
+status must be SUCCEEDED. The endpoint is discovered in this order:
+
+1. `--globus-endpoint ID` or `C4GH_GLOBUS_LOCAL_ENDPOINT=<endpoint-id>`
+   (explicit override; give `--globus-config-dir` too for an isolated
+   endpoint);
 2. the state file `~/.config/crypt4gh/globus.json` written by
    `crypt4gh-install-gcp --ensure-usable` (records the endpoint id, its config
    dir, and shared paths — the only way to find an isolated `-dir` endpoint);
 3. `globus endpoint local-id` (the default GCP endpoint).
 
-If none is configured, crypt4gh stops with a clear error rather than guessing —
-unless you opt into auto-install with `C4GH_GLOBUS_AUTO_INSTALL=1`, which lets it
-install and register a fresh endpoint on the spot.
+If none is configured, crypt4gh stops with a clear error rather than guessing,
+unless you opt into auto-install with `--install-gcp` or
+`C4GH_GLOBUS_AUTO_INSTALL=1`. That lets it install and register a fresh
+endpoint on the spot (named by `--globus-endpoint-name`, default
+`crypt4gh-<hostname>`). You need an authenticated `globus` CLI either way
+(`globus login`).
 
 > **Speed note.** GridFTP throughput needs a data-transfer server at *both* ends,
 > so `--working` must live on storage the local endpoint exposes. crypt4gh shares
 > the working directory automatically; if it sits on storage no reachable
 > collection can see, the transfer would otherwise fall back or fail, and you are
 > warned.
+
+**Troubleshooting.**
+- The endpoint's own output goes to `<config-dir>/gcp-start.log` (by default
+  `~/.local/share/gcp/config/gcp-start.log`). An error that crypt4gh raises
+  about the endpoint quotes the last lines of that log.
+- To check the endpoint by hand, compare
+  `globusconnectpersonal -dir <config-dir> -status` (the local view) with
+  `globus endpoint show <id>` (look for `GCP Connected`) and
+  `globus ls <id>:/` (the Globus service's view).
+- A 502 `GCDisconnected` means the Globus service can't see the endpoint,
+  whatever its local status says.
+
+### Logging
+
+`pack`/`unpack` send the whole run to `--log FILE`, or to `$C4GH_LOG` if that
+is set. This covers the directory walk and tree set-up, every pool worker,
+Globus endpoint management, transfers (task ids and outcomes) and the final
+result:
+
+- If FILE is a JSON `logging.config` dictConfig document, it is applied, as
+  for the streaming verbs' `--log`.
+- Otherwise records are appended to FILE with timestamps and process names.
+  The file gets INFO whatever `-v` says, or DEBUG with `-vv`, which adds a line
+  per item.
+
+```bash
+crypt4gh pack -v --log ~/pack-$(date +%F).log --sk me.sec --recipient_pk them.pub \
+    --working /scratch/w0 ./data globus:<COLLECTION-ID>:/incoming/
+```
 
 ### Installing Globus Connect Personal (Linux)
 
@@ -179,7 +244,12 @@ it downloads the current stable Linux build, unpacks it under
   prints the SHA-256 it fetched so you can pin it next time).
 * `--setup-key <KEY>` — register the endpoint straight away using a setup key
   from <https://app.globus.org/collections?add>.
-* `--start` — start the endpoint after installing (and registering).
+* `--start` — start the endpoint after installing (and registering). It runs
+  in the background, and the command returns once the endpoint is connected.
+* `--dir DIR` — the config directory used by `--setup-key`, `--start`,
+  `--stop` and `--ensure-usable` (`--ensure-usable` defaults to
+  `~/.local/share/gcp/config`).
+* `--stop` — stop the endpoint and wait until it has really exited.
 
 Registration still needs that one-time setup key (Globus has no fully headless
 sign-up). After installing:

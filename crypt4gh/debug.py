@@ -35,7 +35,7 @@ Usage:
 Options:
    -h, --help             Prints this help and exit
    -v, --version          Prints the version and exits
-   --log <file>           Path to the logger file (in YML format)
+   --log <file>           Path to a logging configuration file (JSON, logging.config.dictConfig)
    --sk <keyfile>         Curve25519-based Private key [default: {DEFAULT_SK}]
    --sender_pk <path>     Peer's Curve25519-based Public key to verify provenance (aka, signature)
 

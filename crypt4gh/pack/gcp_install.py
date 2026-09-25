@@ -21,17 +21,23 @@ Design notes
   always print the SHA-256 we downloaded and let ``--sha256`` pin it for
   repeatable installs.
 
-Use as a library (the future ``globus`` transport backend calls
-:func:`ensure_installed`) or as a CLI::
+It also manages the endpoint's lifecycle for the ``globus:`` transport
+(:func:`crypt4gh.pack.transport.ensure_endpoint`): start/stop/restart that wait
+for the instance to really come and go, sharing paths via ``-restrict-paths``
+(:func:`ensure_path_shared`), and the per-user state file
+(``~/.config/crypt4gh/globus.json``) that records which endpoint and config dir
+to use and which paths it currently shares.
 
-    python -m crypt4gh.pack.gcp_install            # install if missing
+Use as a library or as a CLI::
+
+    crypt4gh-install-gcp                           # install the binary if missing
+    crypt4gh-install-gcp --ensure-usable           # install, register, start, record
+    crypt4gh-install-gcp --setup-key <KEY> --start # register with a given key, run
     python -m crypt4gh.pack.gcp_install --force    # reinstall
-    crypt4gh-install-gcp --setup-key <KEY> --start # install, register, run
 
-This installer only *installs* GCP.  Registering the endpoint still needs a
-one-time setup key from https://app.globus.org/collections?add (there is no
-fully headless registration without it); pass it with ``--setup-key`` or run
-``globusconnectpersonal -setup`` yourself afterwards.
+Registering a *new* endpoint needs a one-time setup key: ``--ensure-usable``
+creates one through the authenticated ``globus`` CLI, or pass ``--setup-key``
+from https://app.globus.org/collections?add.
 """
 
 import os
@@ -302,16 +308,6 @@ def ensure_installed(*, url=DEFAULT_URL, share_dir=DEFAULT_SHARE_DIR,
         )
     LOG.info('Downloaded SHA-256: %s (pin with --sha256 for repeatable installs)', sha)
     return launcher
-
-
-def _run_launcher(launcher, *args):
-    """Run ``launcher`` with ``args``, raising :class:`InstallError` on failure."""
-    cmd = [str(launcher), *args]
-    LOG.info('Running: %s', ' '.join(cmd))
-    try:
-        subprocess.run(cmd, check=True)
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise InstallError(f'`{" ".join(cmd)}` failed: {exc}') from exc
 
 
 # ----------------------------------------------------------------------
@@ -700,32 +696,40 @@ def main(argv=None):
     parser = argparse.ArgumentParser(
         prog='crypt4gh-install-gcp',
         description='Install a per-user copy of Globus Connect Personal (Linux) '
-                    'if one is not already on PATH.',
+                    'if one is not already on PATH, and optionally register, start '
+                    'and record it as the local endpoint for crypt4gh pack/unpack '
+                    'globus: transfers.',
+        epilog='The endpoint is recorded in ~/.config/crypt4gh/globus.json '
+               '($XDG_CONFIG_HOME/crypt4gh/globus.json), which pack/unpack read to find '
+               'it; C4GH_GLOBUS_LOCAL_ENDPOINT overrides the id. The endpoint\'s own '
+               'output goes to <config-dir>/gcp-start.log.',
     )
     parser.add_argument('--url', default=DEFAULT_URL,
                         help='Tarball URL (default: current stable Linux build).')
     parser.add_argument('--share-dir', type=Path, default=DEFAULT_SHARE_DIR,
                         help='Where to unpack the distribution '
-                             '(default: ~/.local/share/gcp).')
+                             '(default: ~/.local/share/gcp).', metavar='DIR')
     parser.add_argument('--bin-dir', type=Path, default=DEFAULT_BIN_DIR,
                         help='Where to place the launcher symlink '
-                             '(default: ~/.local/bin).')
+                             '(default: ~/.local/bin).', metavar='DIR')
     parser.add_argument('--sha256', metavar='HEX',
                         help='Expected SHA-256 of the tarball; abort on mismatch.')
     parser.add_argument('--force', action='store_true',
                         help='Reinstall even if globusconnectpersonal is on PATH.')
     parser.add_argument('--ensure-usable', action='store_true',
                         help='Install AND register AND start, then verify the endpoint '
-                             'is connected -- the one-shot "give me a working endpoint" path. '
-                             'Uses --setup-key if given, else auto-creates one via the '
-                             'authenticated `globus` CLI. No-op if already connected.')
+                             'is connected, and record it in the state file -- the one-shot '
+                             '"give me a working endpoint" path. A new registration uses '
+                             '--setup-key if given, else auto-creates one via the '
+                             'authenticated `globus` CLI. Safe to re-run: an endpoint that is '
+                             'already registered or running is left as is and (re)recorded.')
     parser.add_argument('--name', metavar='NAME',
                         help='Display name for an auto-created endpoint '
                              '(default: crypt4gh-<hostname>).')
-    parser.add_argument('--dir', dest='config_dir', type=Path, default=None,
+    parser.add_argument('--dir', dest='config_dir', type=Path, default=None, metavar='DIR',
                         help='Globus config directory for this endpoint (passed as '
                              '-dir). Default with --ensure-usable is '
-                             f'{DEFAULT_CONFIG_DIR}, kept apart from any existing '
+                             '~/.local/share/gcp/config, kept apart from any existing '
                              '~/.globusonline. Pass "" to use the launcher default.')
     parser.add_argument('--setup-key', metavar='KEY',
                         help='Register the endpoint with this setup '
@@ -733,9 +737,10 @@ def main(argv=None):
                              '(runs `globusconnectpersonal -setup --setup-key KEY`).')
     parser.add_argument('--start', action='store_true',
                         help='After install/setup, start the endpoint '
-                             '(runs `globusconnectpersonal -start &`).')
+                             '(runs `globusconnectpersonal -start`).')
     parser.add_argument('--stop', action='store_true',
-                        help='Stop a running endpoint for --dir and exit.')
+                        help='Stop a running endpoint for --dir, wait until it has '
+                             'really exited, and exit.')
     parser.add_argument('-v', '--verbose', action='count', default=0,
                         help='Increase logging verbosity.')
     args = parser.parse_args(argv)
@@ -777,10 +782,13 @@ def main(argv=None):
             url=args.url, share_dir=args.share_dir, bin_dir=args.bin_dir,
             force=args.force, expected_sha256=args.sha256,
         )
+        config_dir = args.config_dir or None
         if args.setup_key:
-            _run_launcher(launcher, '-setup', '--setup-key', args.setup_key)
+            setup(launcher, args.setup_key, config_dir=config_dir)
         if args.start:
-            _run_launcher(launcher, '-start')
+            # In the background, waiting until connected -- not a foreground
+            # `-start`, which would never return.
+            start(launcher, config_dir=config_dir)
     except InstallError as exc:
         print(f'error: {exc}', file=sys.stderr)
         return 1

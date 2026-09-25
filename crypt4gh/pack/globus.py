@@ -3,16 +3,18 @@
 
 The pack/unpack transport shells out to the Globus CLI rather than embedding
 ``globus-sdk`` -- the CLI is already installed and authenticated on the target
-data-mover hosts, it discovers the local Globus Connect Personal endpoint for
-us (``globus endpoint local-id``), and shelling out matches how the rest of the
-transport layer drives ``rsync``/``ssh``.  Every subprocess call goes through
+data-mover hosts, and shelling out matches how the rest of the transport layer
+drives ``rsync``/``ssh``.  The local Globus Connect Personal endpoint is found by
+:func:`resolve_local_endpoint` (env override, then the state file, then
+``globus endpoint local-id``).  Every subprocess call goes through
 :func:`_run`/:func:`_json` so unit tests can mock the CLI without a live Globus.
 
 A GridFTP transfer needs a data-transfer server at *both* ends.  The remote end
 is the target collection (``globus:<id>:/path``); the local end is this host's
 GCP endpoint, whose id we look up here.  For that to move bytes at speed, the
-staged ``--working`` directory must sit on storage the local endpoint exposes
-(see :func:`working_is_shared`).
+staged ``--working`` directory must sit on storage the local endpoint exposes;
+:func:`crypt4gh.pack.transport.ensure_endpoint` shares it (restarting the
+endpoint) and waits for :func:`endpoint_reachable` before transferring.
 """
 
 import os

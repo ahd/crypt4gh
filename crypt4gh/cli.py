@@ -25,6 +25,10 @@ __doc__ = f'''
 
 Utility for the cryptographic GA4GH standard, reading from stdin and outputting to stdout.
 
+Whole directory trees (local, ssh or Globus; parallel, with a catalog):
+   {PROG} pack [options] <source> <dest>      see: {PROG} pack --help
+   {PROG} unpack [options] <source> <dest>    see: {PROG} unpack --help
+
 Usage:
    {PROG} [-hv] [--log <file>] encrypt [--sk <path>] --recipient_pk <path> [--recipient_pk <path>]... [--range <start-end>] [--header <path>]
    {PROG} [-hv] [--log <file>] decrypt [--sk <path>] [--sender_pk <path>] [--range <start-end>]
@@ -34,7 +38,7 @@ Usage:
 Options:
    -h, --help             Prints this help and exit
    -v, --version          Prints the version and exits
-   --log <file>           Path to the logger file (in YML format)
+   --log <file>           Path to a logging configuration file (JSON, logging.config.dictConfig)
    --sk <keyfile>         Curve25519-based Private key
                           When encrypting, if neither the private key nor C4GH_SECRET_KEY are specified, we generate a new key 
    --recipient_pk <path>  Recipient's Curve25519-based Public key

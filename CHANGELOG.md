@@ -53,16 +53,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   archives, and can register (`--setup-key`) and start (`--start`) the endpoint.
   `--ensure-usable` does the lot in one shot (install, register, start, verify
   connected) and records the endpoint in the state file for the transport.
-- A `pytest` unit-test suite under `tests/unit/` (crypto/header, key formats,
-  KDFs, naming, codecs, catalog, transport parsing, and pack/unpack round-trips).
-
-### Changed
-- Packaging modernized: metadata moved to `pyproject.toml` (PEP 621); `setup.py`
-  retained only as the libsodium C-extension build shim. `uv` is supported
-  (`uv sync`, `uv run pytest`, `uv build`).
-- Minimum Python raised to **3.13**.
-
-### Added (logging)
 - `pack`/`unpack` accept `--log FILE`, defaulting to `$C4GH_LOG`:
   - If FILE is a JSON `logging.config` document, it is applied, exactly as for
     the streaming verbs.
@@ -73,8 +63,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     directory walk and tree preparation, each item at DEBUG, Globus endpoint
     management and transfers (task ids and outcomes), and the final result or
     error.
+- A `pytest` unit-test suite under `tests/unit/` (crypto/header, key formats,
+  KDFs, naming, codecs, catalog, transport parsing, and pack/unpack round-trips).
+
+### Changed
+- `crypt4gh pack --help` / `unpack --help` now cover every option, all the
+  environment variables (`C4GH_SECRET_KEY`, `C4GH_PASSPHRASE`, `C4GH_WORKDIR`,
+  `C4GH_LOG`, `C4GH_DEBUG`, `C4GH_GLOBUS_LOCAL_ENDPOINT`,
+  `C4GH_GLOBUS_AUTO_INSTALL`, `XDG_CONFIG_HOME`), the endpoint forms, how a
+  `globus:` leg manages the endpoint, and examples. `crypt4gh -h` now points
+  to them. `--log` is correctly described as a JSON dictConfig file (it had
+  said YML).
+- Packaging modernized: metadata moved to `pyproject.toml` (PEP 621); `setup.py`
+  retained only as the libsodium C-extension build shim. `uv` is supported
+  (`uv sync`, `uv run pytest`, `uv build`).
+- Minimum Python raised to **3.13**.
 
 ### Fixed
+- `crypt4gh-install-gcp --start` no longer blocks forever: it used to run
+  `-start` in the foreground. `--setup-key` and `--start` now also honour
+  `--dir`.
 - A `globus:` leg no longer hangs on a Globus Connect Personal endpoint that the
   Globus service cannot see (HTTP 502 `GCDisconnected`), even though its local
   `-status` says "connected". Seen live when the endpoint was restarted to share

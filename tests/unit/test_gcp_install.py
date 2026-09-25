@@ -556,3 +556,15 @@ def test_ensure_path_shared_passes_verify(monkeypatch, tmp_path):
     g.ensure_path_shared('gcp', 'EP', '/c', str(tmp_path / 'stage'),
                          state_path=tmp_path / 'globus.json', verify=sentinel)
     assert seen['verify'] is sentinel
+
+
+def test_main_setup_and_start_honour_dir(monkeypatch, tmp_path):
+    # --start used to run a foreground `-start` (never returned) and both
+    # --setup-key and --start ignored --dir.
+    calls = []
+    monkeypatch.setattr(g, 'ensure_installed', lambda **k: 'gcp')
+    monkeypatch.setattr(g, 'setup', lambda l, key, config_dir=None: calls.append(('setup', key, config_dir)))
+    monkeypatch.setattr(g, 'start', lambda l, config_dir=None: calls.append(('start', config_dir)))
+    cfg = tmp_path / 'cfg'
+    assert g.main(['--setup-key', 'KEY', '--start', '--dir', str(cfg)]) == 0
+    assert calls == [('setup', 'KEY', cfg), ('start', cfg)]
